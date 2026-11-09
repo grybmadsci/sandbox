@@ -1,0 +1,18 @@
+{
+  "browser": {
+    "browserName": "chromium",
+    "launchOptions": {
+      "headless": false,
+      "args": [
+        "--enable-unsafe-webgpu",
+        "--enable-features=Vulkan",
+        "--use-vulkan=swiftshader",
+        "--use-webgpu-adapter=swiftshader",
+        "--use-angle=swiftshader"
+      ]
+    },
+    "contextOptions": {
+      "viewport": { "width": 1280, "height": 720 }
+    }
+  }
+}

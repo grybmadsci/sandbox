@@ -1,35 +1,37 @@
 import { create } from 'zustand'
+import { palette, type MaterialKey } from '../sim/materials'
 
-export const shapes = ['box', 'ball', 'plank'] as const
-export type Shape = (typeof shapes)[number]
-
-export type Body = {
-  id: number
-  shape: Shape
-  position: [number, number]
-  color: string
-}
+export const MIN_BRUSH = 1
+export const MAX_BRUSH = 40
 
 type SandboxState = {
-  bodies: Body[]
-  selected: Shape
-  select: (shape: Shape) => void
-  spawn: (position: [number, number]) => void
-  remove: (id: number) => void
+  material: MaterialKey
+  brushSize: number
+  paused: boolean
+  /** Bumped to ask the simulation to regenerate the level / clear the grid. */
+  resetCount: number
+  clearCount: number
+  error: string | null
+  select: (material: MaterialKey) => void
+  resizeBrush: (delta: number) => void
+  togglePause: () => void
+  reset: () => void
   clear: () => void
+  fail: (error: string) => void
 }
 
-let nextId = 0
-const randomColor = () => `hsl(${Math.floor(Math.random() * 360)}, 65%, 60%)`
-
 export const useSandbox = create<SandboxState>((set) => ({
-  bodies: [],
-  selected: 'box',
-  select: (selected) => set({ selected }),
-  spawn: (position) =>
-    set((s) => ({
-      bodies: [...s.bodies, { id: nextId++, shape: s.selected, position, color: randomColor() }],
-    })),
-  remove: (id) => set((s) => ({ bodies: s.bodies.filter((b) => b.id !== id) })),
-  clear: () => set({ bodies: [] }),
+  material: palette[0],
+  brushSize: 6,
+  paused: false,
+  resetCount: 0,
+  clearCount: 0,
+  error: null,
+  select: (material) => set({ material }),
+  resizeBrush: (delta) =>
+    set((s) => ({ brushSize: Math.min(MAX_BRUSH, Math.max(MIN_BRUSH, s.brushSize + delta)) })),
+  togglePause: () => set((s) => ({ paused: !s.paused })),
+  reset: () => set((s) => ({ resetCount: s.resetCount + 1 })),
+  clear: () => set((s) => ({ clearCount: s.clearCount + 1 })),
+  fail: (error) => set({ error }),
 }))
