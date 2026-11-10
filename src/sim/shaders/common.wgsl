@@ -1,7 +1,8 @@
 // Shared prelude: helpers used by every kernel. Material constants and tables
 // (MAT_*, KIND_*, MATERIAL_*) are generated in materials.ts and placed before this.
 //
-// Cell layout (u32): bits 0-7 material id, bits 8-15 per-grain shade (moves with the grain).
+// Cell layout (u32): bits 0-7 material id, bits 8-15 per-grain shade, bit 16 liquid flow
+// direction (0 = right, 1 = left). The whole cell moves together, so all of it travels with the grain.
 // Grid y grows downward (row 0 is the top); gravity is +y.
 
 fn cellMaterial(cell: u32) -> u32 {
@@ -20,8 +21,20 @@ fn cellDensity(cell: u32) -> u32 {
   return MATERIAL_DENSITY[cellMaterial(cell)];
 }
 
-fn makeCell(materialId: u32, shade: u32) -> u32 {
-  return materialId | ((shade & 0xffu) << 8u);
+// `variant` is random bits: the low 8 pick the shade, bit 8 the initial flow direction.
+fn makeCell(materialId: u32, variant: u32) -> u32 {
+  return materialId | ((variant & 0x1ffu) << 8u);
+}
+
+const DIR_RIGHT: u32 = 0u;
+const DIR_LEFT: u32 = 1u;
+
+fn cellDirection(cell: u32) -> u32 {
+  return (cell >> 16u) & 1u;
+}
+
+fn flipDirection(cell: u32) -> u32 {
+  return cell ^ (1u << 16u);
 }
 
 fn inGrid(p: vec2i, size: vec2u) -> bool {
@@ -52,9 +65,4 @@ fn isMovable(cell: u32) -> bool {
 // Can `a` trade places with `b` by moving down (or sideways) into it?
 fn sinksInto(a: u32, b: u32) -> bool {
   return isMovable(a) && cellKind(b) != KIND_SOLID && cellDensity(a) > cellDensity(b);
-}
-
-// Can a liquid in either cell flow sideways into the other?
-fn flowsBetween(a: u32, b: u32) -> bool {
-  return (cellKind(a) == KIND_LIQUID && sinksInto(a, b)) || (cellKind(b) == KIND_LIQUID && sinksInto(b, a));
 }

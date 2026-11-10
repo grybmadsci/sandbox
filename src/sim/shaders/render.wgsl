@@ -15,10 +15,12 @@ fn sandColor(
   if (m == MAT_EMPTY) {
     color = mix(vec3f(0.06, 0.08, 0.14), vec3f(0.12, 0.14, 0.22), f32(gy) / f32(size.y));
   } else {
-    let s = f32(cellShade(cell)) / 255.0;
-    color = MATERIAL_COLOR[m] * (0.82 + 0.3 * s);
+    // Per-cell shade in [-1, 1], scaled by the material's grain.
+    let s = f32(cellShade(cell)) / 127.5 - 1.0;
+    color = MATERIAL_COLOR[m] * (1.0 + MATERIAL_GRAIN[m] * s);
     if (cellKind(cell) == KIND_LIQUID) {
-      color *= 0.95 + 0.08 * sin(time * 3.0 + f32(gx) * 0.15 + s * 6.28);
+      // Smooth travelling ripple, the same for neighbouring cells (no per-cell flicker).
+      color *= 1.0 + 0.04 * sin(time * 2.0 + f32(gx) * 0.08 + f32(gy) * 0.05);
     }
   }
   return vec4f(pow(color, vec3f(2.2)), 1.0);

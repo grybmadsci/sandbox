@@ -33,5 +33,5 @@ fn paintStroke(
       return;
     }
   }
-  (*cells)[index] = makeCell(materialId, h >> 16u);
+  (*cells)[index] = makeCell(materialId, h >> 16u);  // random shade + flow direction
 }

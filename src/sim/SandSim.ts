@@ -1,8 +1,9 @@
 import { MeshBasicNodeMaterial, Vector2, type ComputeNode, type Node, type WebGPURenderer } from 'three/webgpu'
 import { instanceIndex, instancedArray, time, uint, uniform, uv, uvec2, wgsl, wgslFn } from 'three/tsl'
-import { materialsWgsl } from './materials'
+import { materialsWgsl, maxSpread } from './materials'
 import commonWgsl from './shaders/common.wgsl?raw'
 import stepWgsl from './shaders/step.wgsl?raw'
+import flowWgsl from './shaders/flow.wgsl?raw'
 import paintWgsl from './shaders/paint.wgsl?raw'
 import levelWgsl from './shaders/level.wgsl?raw'
 import renderWgsl from './shaders/render.wgsl?raw'
@@ -10,6 +11,7 @@ import renderWgsl from './shaders/render.wgsl?raw'
 const prelude = wgsl(materialsWgsl + commonWgsl)
 
 const stepBlock = wgslFn(stepWgsl, [prelude])
+const flowPair = wgslFn(flowWgsl, [prelude])
 const paintStroke = wgslFn(paintWgsl, [prelude])
 const fillLevel = wgslFn(levelWgsl, [prelude])
 const sandColor = wgslFn(renderWgsl, [prelude])
@@ -33,9 +35,14 @@ export class SandSim {
   private readonly strokeEnd = uniform(new Vector2())
   private readonly radius = uniform(4)
   private readonly brushMaterial = uniform(0, 'uint')
+  private readonly flowOffset = uniform(0, 'uint')
+  private readonly flowPass = uniform(0, 'uint')
+  private stepCount = 0
 
   private readonly stepEven: ComputeNode
   private readonly stepOdd: ComputeNode
+  /** Sideways liquid flow, one node per row parity; dispatched together each pass. */
+  private readonly flowRows: ComputeNode[]
   private readonly paintNode: ComputeNode
   private readonly fillNode: ComputeNode
 
@@ -60,6 +67,18 @@ export class SandSim {
     this.stepEven = step(0)
     this.stepOdd = step(1)
 
+    const pairCount = (Math.floor(width / 2) + 1) * Math.ceil(height / 2)
+    this.flowRows = [0, 1].map((rowParity) =>
+      flowPair({
+        cells: this.cells,
+        index: instanceIndex,
+        size,
+        offset: this.flowOffset,
+        rowParity: uint(rowParity),
+        passIndex: this.flowPass,
+      }).compute(pairCount, [64]),
+    )
+
     this.paintNode = paintStroke({
       cells: this.cells,
       index: instanceIndex,
@@ -83,12 +102,22 @@ export class SandSim {
     this.material.colorNode = sandColor({ cells: this.cells, uv: uv(), size, time }) as Node<'vec4'>
   }
 
-  /** One simulation step: two Margolus passes with alternating block offsets. */
+  /**
+   * One simulation step: two Margolus passes with alternating block offsets
+   * (falling and sliding), then `maxSpread` sideways liquid-flow passes.
+   */
   step(renderer: WebGPURenderer) {
     this.seed.value = randomSeed()
     renderer.compute(this.stepEven)
     this.seed.value = randomSeed()
     renderer.compute(this.stepOdd)
+
+    for (let pass = 0; pass < maxSpread; pass++) {
+      this.flowPass.value = pass
+      this.flowOffset.value = (pass + this.stepCount) & 1
+      renderer.compute(this.flowRows)
+    }
+    this.stepCount++
   }
 
   /** Paint a stroke between two grid positions (cells, y down). */

@@ -4,6 +4,7 @@
 // block, so it can read and write it in place with no races. Alternate passes
 // shift the block grid by (1, 1) so material can cross block boundaries.
 // Cells outside the grid read as stone, so nothing leaves through the edges.
+// Sideways liquid flow is a separate kernel (flow.wgsl).
 fn stepBlock(
   cells: ptr<storage, array<u32>, read_write>,
   index: u32,
@@ -59,15 +60,6 @@ fn stepBlock(
         t = c[1]; c[1] = c[2]; c[2] = t;
       }
     }
-  }
-
-  // 3. Liquids spread sideways into lighter, non-solid neighbours.
-  let flowChance = 0.6;
-  if (flowsBetween(c[2], c[3]) && hashUnit(hashPcg(r + 3u)) < flowChance) {
-    t = c[2]; c[2] = c[3]; c[3] = t;
-  }
-  if (flowsBetween(c[0], c[1]) && hashUnit(hashPcg(r + 4u)) < flowChance) {
-    t = c[0]; c[0] = c[1]; c[1] = t;
   }
 
   for (var i = 0u; i < 4u; i++) {

@@ -31,8 +31,13 @@ Each simulation step runs two passes of a **Margolus-neighbourhood** automaton: 
 grid is split into disjoint 2x2 blocks, one invocation per block, so every block can
 be updated in place without races. The second pass shifts the blocks by (1, 1) so
 material can cross block edges. Within a block, heavier movable cells fall, then slide
-diagonally, and liquids spread sideways. Density decides who sinks through whom, so
-sand sinks in water and oil floats on it.
+diagonally. Density decides who sinks through whom, so sand sinks in water and oil
+floats on it.
+
+Liquids then spread sideways in separate flow passes (`flow.wgsl`) over horizontal
+pairs of cells. Each liquid cell stores a flow direction, keeps moving that way while
+resting on something, and turns around when blocked, so pools level out quickly.
+How far each liquid can flow per step is its `spread` value in `materials.ts`.
 
 Each `.wgsl` kernel is a single function loaded with `?raw` and wrapped with
 `wgslFn()`. A shared prelude (`common.wgsl` plus WGSL constants generated from the
@@ -50,7 +55,8 @@ src/
     materials.ts       material table (single source of truth) -> WGSL constants
     shaders/
       common.wgsl      shared helpers (prelude)
-      step.wgsl        Margolus step kernel
+      step.wgsl        Margolus step kernel (falling, sliding)
+      flow.wgsl        sideways liquid flow kernel
       paint.wgsl       brush stroke kernel
       level.wgsl       level generation / clear kernel
       render.wgsl      fragment colour function
