@@ -1,12 +1,22 @@
-import { materialByKey, palette } from '../sim/materials'
+import { materialByKey } from '../sim/materials'
 import { useSandbox } from '../game/store'
+import { toolName, tools, type Tool } from '../game/tools'
 
 const toCss = ([r, g, b]: readonly number[]) => `rgb(${r * 255}, ${g * 255}, ${b * 255})`
 
+/** Palette swatch: the material color, a dashed box for the eraser, a ring for air. */
+const swatchStyle = (tool: Tool) => {
+  if (tool === 'AIR') return { borderRadius: 5, border: '2px solid #9fd3ff' }
+  const m = materialByKey[tool]
+  if (m.kind === 'empty') return { border: '1px dashed #fff' }
+  return { background: toCss(m.color) }
+}
+
 export function Hud() {
-  const selected = useSandbox((s) => s.material)
+  const selected = useSandbox((s) => s.tool)
   const brushSize = useSandbox((s) => s.brushSize)
   const paused = useSandbox((s) => s.paused)
+  const pressureView = useSandbox((s) => s.pressureView)
   const error = useSandbox((s) => s.error)
   const select = useSandbox((s) => s.select)
 
@@ -36,8 +46,7 @@ export function Hud() {
       }}
     >
       <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', pointerEvents: 'auto' }}>
-        {palette.map((key, i) => {
-          const m = materialByKey[key]
+        {tools.map((key, i) => {
           const active = key === selected
           return (
             <button
@@ -61,20 +70,23 @@ export function Hud() {
                   width: 10,
                   height: 10,
                   borderRadius: 2,
-                  background: m.kind === 'empty' ? 'transparent' : toCss(m.color),
-                  border: m.kind === 'empty' ? '1px dashed #fff' : 'none',
+                  boxSizing: 'border-box',
+                  ...swatchStyle(key),
                 }}
               />
-              {i + 1} {m.name}
+              {i + 1} {toolName(key)}
             </button>
           )
         })}
       </div>
       <div style={{ marginTop: 6 }}>
-        Brush: {brushSize} {paused && <strong style={{ marginLeft: 12 }}>PAUSED</strong>}
+        Brush: {brushSize} {pressureView && <strong style={{ marginLeft: 12 }}>PRESSURE VIEW</strong>}
+        {paused && <strong style={{ marginLeft: 12 }}>PAUSED</strong>}
       </div>
       <div style={{ opacity: 0.6 }}>
-        Left drag: paint · [ ]: brush size · Space: pause · R: reset level · C: clear
+        Left drag: paint (Air: hold to pump pressure, drag to blow) · [ ]: brush size
+        <br />
+        P: pressure view · Space: pause · R: reset level · C: clear
         <br />
         WASD / arrows or right-drag: pan (Shift = fast) · Wheel or Q/E: zoom
       </div>

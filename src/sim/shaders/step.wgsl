@@ -4,11 +4,13 @@
 // block, so it can read and write it in place with no races. Alternate passes
 // shift the block grid by (1, 1) so material can cross block boundaries.
 // Cells outside the grid read as stone, so nothing leaves through the edges.
-// Sideways liquid flow is a separate kernel (flow.wgsl).
+// Sideways flow and static pressure are separate kernels (flow.wgsl, pressure.wgsl).
 fn stepBlock(
   cells: ptr<storage, array<u32>, read_write>,
+  air: ptr<storage, array<i32>, read_write>,
   index: u32,
   size: vec2u,
+  airSize: vec2u,
   offset: u32,
   seed: u32,
 ) -> void {
@@ -35,30 +37,67 @@ fn stepBlock(
   let r = hashPcg(index ^ hashPcg(seed));
   var t: u32;
 
-  // 1. Fall straight down. Sinking through a liquid is slowed (viscosity).
-  if (sinksInto(c[0], c[2]) && (cellMaterial(c[2]) == MAT_EMPTY || hashUnit(r) < 0.5)) {
+  // 1. Fall straight down (gases rise: empty space sinks into them). Sinking through
+  // a liquid is slowed (viscosity).
+  if (sinksInto(c[0], c[2]) && (passesFreely(c[0], c[2]) || chance16(r, 32768u))) {
     t = c[0]; c[0] = c[2]; c[2] = t;
   }
-  if (sinksInto(c[1], c[3]) && (cellMaterial(c[3]) == MAT_EMPTY || hashUnit(r >> 16u) < 0.5)) {
+  if (sinksInto(c[1], c[3]) && (passesFreely(c[1], c[3]) || chance16(r >> 16u, 32768u))) {
     t = c[1]; c[1] = c[3]; c[3] = t;
   }
 
-  // 2. Slide diagonally when blocked below. Random order avoids a left/right bias.
-  let diagonalChance = 0.85;
+  // 2. Slide diagonally when blocked: falling cells down, gases up. Random order avoids a left/right bias.
+  let diagonalChance = 55705u;  // 0.85
   let leftFirst = (r & 0x80000000u) != 0u;
   for (var i = 0u; i < 2u; i++) {
     if ((i == 0u) == leftFirst) {
-      // top-left -> bottom-right
-      if (sinksInto(c[0], c[3]) && !sinksInto(c[0], c[2]) && cellKind(c[1]) != KIND_SOLID
-          && hashUnit(hashPcg(r + 1u)) < diagonalChance) {
+      // top-left <-> bottom-right
+      if (slidesDiagonally(c[0], c[3], c[2], c[1]) && chance16(hashPcg(r + 1u), diagonalChance)) {
         t = c[0]; c[0] = c[3]; c[3] = t;
       }
     } else {
-      // top-right -> bottom-left
-      if (sinksInto(c[1], c[2]) && !sinksInto(c[1], c[3]) && cellKind(c[0]) != KIND_SOLID
-          && hashUnit(hashPcg(r + 2u)) < diagonalChance) {
+      // top-right <-> bottom-left
+      if (slidesDiagonally(c[1], c[2], c[3], c[0]) && chance16(hashPcg(r + 2u), diagonalChance)) {
         t = c[1]; c[1] = c[2]; c[2] = t;
       }
+    }
+  }
+
+  // 3. Wind (dynamic pressure) pushes cells into empty space or gas, more strongly for high-drag materials.
+  let a = airIndex((origin + 1) / i32(AIR_CELL), airSize);
+  let wind = vec2i((*air)[a + AIR_VX], (*air)[a + AIR_VY]);
+  let speed = vec2u(abs(wind));
+  if (speed.x != 0u) {
+    let right = wind.x > 0;
+    for (var row = 0u; row < 4u; row += 2u) {
+      let mover = select(row + 1u, row, right);
+      let dest = select(row, row + 1u, right);
+      if (blownInto(c[mover], c[dest], speed.x, hashPcg(r + 3u + row))) {
+        t = c[mover]; c[mover] = c[dest]; c[dest] = t;
+      }
+    }
+  }
+  if (speed.y != 0u) {
+    let down = wind.y > 0;
+    for (var col = 0u; col < 2u; col++) {
+      let mover = select(col + 2u, col, down);
+      let dest = select(col, col + 2u, down);
+      if (blownInto(c[mover], c[dest], speed.y, hashPcg(r + 7u + col))) {
+        t = c[mover]; c[mover] = c[dest]; c[dest] = t;
+      }
+    }
+  }
+
+  // 4. Gases decay (smoke settles into soot, steam condenses into water), and turn around at
+  // random so their sideways drift (flow.wgsl) spreads them out.
+  for (var i = 0u; i < 4u; i++) {
+    let m = cellMaterial(c[i]);
+    let h = hashPcg(r + 11u + i);
+    if (MATERIAL_DECAY[m] != 0u && chance16(h, MATERIAL_DECAY[m])) {
+      let into = MATERIAL_DECAY_INTO[m];
+      c[i] = select(makeCell(into, h >> 16u), MAT_EMPTY, into == MAT_EMPTY);
+    } else if (MATERIAL_KIND[m] == KIND_GAS && chance16(h >> 16u, 16384u)) {
+      c[i] = flipDirection(c[i]);
     }
   }
 

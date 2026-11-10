@@ -1,14 +1,25 @@
 // Fills the whole grid: mode 0 clears it, mode 1 generates the starting level
-// (rolling stone terrain, a few ledges, sand dunes and a lake). One invocation per cell.
+// (rolling stone terrain, a few ledges, sand dunes, a lake and a U-tube). It also
+// resets the air (filled with still air at ambient pressure by the next air step) and
+// the pressure field. One invocation per cell.
 fn fillLevel(
   cells: ptr<storage, array<u32>, read_write>,
+  air: ptr<storage, array<i32>, read_write>,
+  fieldA: ptr<storage, array<u32>, read_write>,
+  fieldB: ptr<storage, array<u32>, read_write>,
   index: u32,
   size: vec2u,
+  airSize: vec2u,
   mode: u32,
 ) -> void {
+  if (index < airSize.x * airSize.y * 4u) {
+    (*air)[index] = select(0, -1, index % 4u == AIR_VOLUME);
+  }
   if (index >= size.x * size.y) {
     return;
   }
+  (*fieldA)[index] = FIELD_NONE;
+  (*fieldB)[index] = FIELD_NONE;
   if (mode == 0u) {
     (*cells)[index] = MAT_EMPTY;
     return;
@@ -37,6 +48,24 @@ fn fillLevel(
   let ledgeUp = h * (0.5 + 0.12 * sin(ledgeIndex * 2.3));
   if (ledgeX > 150.0 && ledgeX < 230.0 && abs(up - ledgeUp) < 3.0) {
     cell = MAT_STONE;
+  }
+
+  // A U-tube (connected vessels), left arm filled with water: static pressure levels it out.
+  let tubeLeft = 300.0;
+  let tubeBottom = h * 0.6;
+  if (x >= tubeLeft && x < tubeLeft + 96.0 && up >= tubeBottom && up < tubeBottom + 130.0) {
+    let tx = x - tubeLeft;
+    let ty = up - tubeBottom;
+    let channel = ty >= 4.0 && ty < 16.0 && tx >= 4.0 && tx < 92.0;
+    let leftArm = ty >= 4.0 && tx >= 4.0 && tx < 20.0;
+    let rightArm = ty >= 4.0 && tx >= 76.0 && tx < 92.0;
+    if ((leftArm && ty < 120.0) || (channel && tx < 76.0)) {
+      cell = MAT_WATER;
+    } else if (channel || leftArm || rightArm) {
+      cell = MAT_EMPTY;
+    } else {
+      cell = MAT_STONE;
+    }
   }
 
   // A lake that settles into the terrain.

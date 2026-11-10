@@ -59,9 +59,11 @@ export function SandWorld({ width, height }: Props) {
     }
 
     if (s.painting) {
-      sim.paint(renderer, s.last, s.current, game.brushSize, materialByKey[game.material].id)
+      if (game.tool === 'AIR') sim.blow(renderer, s.last, s.current, game.brushSize)
+      else sim.paint(renderer, s.last, s.current, game.brushSize, materialByKey[game.tool].id)
       s.last.copy(s.current)
     }
+    sim.setPressureView(game.pressureView)
 
     if (game.paused) return
     s.accumulator = Math.min(s.accumulator + delta * STEPS_PER_SECOND, MAX_STEPS_PER_FRAME)

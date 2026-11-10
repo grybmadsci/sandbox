@@ -1,5 +1,5 @@
 import { useEffect } from 'react'
-import { palette } from '../sim/materials'
+import { tools } from './tools'
 import { useSandbox } from './store'
 
 /** Currently held keys, by KeyboardEvent.code. Read every frame by the camera. */
@@ -26,7 +26,7 @@ export function useInput() {
 
       const game = useSandbox.getState()
       const index = Number(e.key) - 1
-      if (Number.isInteger(index) && index >= 0 && index < palette.length) game.select(palette[index])
+      if (Number.isInteger(index) && index >= 0 && index < tools.length) game.select(tools[index])
       if (e.code === 'BracketLeft') game.resizeBrush(-1)
       if (e.code === 'BracketRight') game.resizeBrush(1)
       if (e.code === 'Space') {
@@ -35,6 +35,7 @@ export function useInput() {
       }
       if (e.code === 'KeyR') game.reset()
       if (e.code === 'KeyC') game.clear()
+      if (e.code === 'KeyP') game.togglePressureView()
     }
     const onKeyUp = (e: KeyboardEvent) => heldKeys.delete(e.code)
     const onBlur = () => heldKeys.clear()
