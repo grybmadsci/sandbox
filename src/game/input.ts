@@ -25,7 +25,8 @@ export function useInput() {
       if (e.repeat) return
 
       const game = useSandbox.getState()
-      const index = Number(e.key) - 1
+      if (e.code === 'KeyI') game.select('INSPECT')
+      const index = e.key === '0' ? 9 : Number(e.key) - 1
       if (Number.isInteger(index) && index >= 0 && index < tools.length) game.select(tools[index])
       if (e.code === 'BracketLeft') game.resizeBrush(-1)
       if (e.code === 'BracketRight') game.resizeBrush(1)

@@ -38,11 +38,15 @@ fn stepBlock(
   var t: u32;
 
   // 1. Fall straight down (gases rise: empty space sinks into them). Sinking through
-  // a liquid is slowed (viscosity).
-  if (sinksInto(c[0], c[2]) && (passesFreely(c[0], c[2]) || chance16(r, 32768u))) {
+  // a liquid is slowed (viscosity). Falling liquid now and then skips a fall
+  // (LIQUID_FALL_SKIP), so a falling stream doesn't lock into evenly spaced bands.
+  let skip = hashPcg(r + 13u);
+  let skipsLeft = cellKind(c[0]) == KIND_LIQUID && chance16(skip, LIQUID_FALL_SKIP);
+  let skipsRight = cellKind(c[1]) == KIND_LIQUID && chance16(skip >> 16u, LIQUID_FALL_SKIP);
+  if (sinksInto(c[0], c[2]) && ((passesFreely(c[0], c[2]) && !skipsLeft) || chance16(r, 32768u))) {
     t = c[0]; c[0] = c[2]; c[2] = t;
   }
-  if (sinksInto(c[1], c[3]) && (passesFreely(c[1], c[3]) || chance16(r >> 16u, 32768u))) {
+  if (sinksInto(c[1], c[3]) && ((passesFreely(c[1], c[3]) && !skipsRight) || chance16(r >> 16u, 32768u))) {
     t = c[1]; c[1] = c[3]; c[3] = t;
   }
 
@@ -65,7 +69,7 @@ fn stepBlock(
 
   // 3. Wind (dynamic pressure) pushes cells into empty space or gas, more strongly for high-drag materials.
   let a = airIndex((origin + 1) / i32(AIR_CELL), airSize);
-  let wind = vec2i((*air)[a + AIR_VX], (*air)[a + AIR_VY]);
+  let wind = vec2i(airWind((*air)[a + AIR_VX]), airWind((*air)[a + AIR_VY]));
   let speed = vec2u(abs(wind));
   if (speed.x != 0u) {
     let right = wind.x > 0;

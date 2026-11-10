@@ -1,4 +1,5 @@
 import { create } from 'zustand'
+import type { Inspection } from '../sim/inspect'
 import { tools, type Tool } from './tools'
 
 export const MIN_BRUSH = 1
@@ -13,6 +14,8 @@ type SandboxState = {
   resetCount: number
   clearCount: number
   error: string | null
+  /** The inspect tool's readout for the cell under the cursor. */
+  inspection: Inspection | null
   select: (tool: Tool) => void
   resizeBrush: (delta: number) => void
   togglePause: () => void
@@ -20,6 +23,7 @@ type SandboxState = {
   reset: () => void
   clear: () => void
   fail: (error: string) => void
+  inspect: (inspection: Inspection | null) => void
 }
 
 export const useSandbox = create<SandboxState>((set) => ({
@@ -30,6 +34,7 @@ export const useSandbox = create<SandboxState>((set) => ({
   resetCount: 0,
   clearCount: 0,
   error: null,
+  inspection: null,
   select: (tool) => set({ tool }),
   resizeBrush: (delta) =>
     set((s) => ({ brushSize: Math.min(MAX_BRUSH, Math.max(MIN_BRUSH, s.brushSize + delta)) })),
@@ -38,4 +43,5 @@ export const useSandbox = create<SandboxState>((set) => ({
   reset: () => set((s) => ({ resetCount: s.resetCount + 1 })),
   clear: () => set((s) => ({ clearCount: s.clearCount + 1 })),
   fail: (error) => set({ error }),
+  inspect: (inspection) => set({ inspection }),
 }))
