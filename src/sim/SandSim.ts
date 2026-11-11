@@ -12,6 +12,16 @@ import inspectWgsl from './shaders/inspect.wgsl?raw'
 import paintWgsl from './shaders/paint.wgsl?raw'
 import levelWgsl from './shaders/level.wgsl?raw'
 import renderWgsl from './shaders/render.wgsl?raw'
+import stampWgsl from './shaders/stamp.wgsl?raw'
+import bodyForcesWgsl from './shaders/bodyForces.wgsl?raw'
+import bodyBuoyancyWgsl from './shaders/bodyBuoyancy.wgsl?raw'
+import solidMaskWgsl from './shaders/solidMask.wgsl?raw'
+import laserWgsl from './shaders/laser.wgsl?raw'
+import placementWgsl from './shaders/placement.wgsl?raw'
+import carryWgsl from './shaders/carry.wgsl?raw'
+import shelterWgsl from './shaders/shelter.wgsl?raw'
+import { BODY_FLOATS, BODY_FORCE_INTS, MAX_BODIES, SHELTER_FLOATS } from './bodies'
+import { LASER_FLOATS, LASER_RAYS, MAX_LASERS } from './objects'
 
 const prelude = wgsl(materialsWgsl + commonWgsl)
 
@@ -25,6 +35,17 @@ const paintStroke = wgslFn(paintWgsl, [prelude])
 const fillLevel = wgslFn(levelWgsl, [prelude])
 const sandColor = wgslFn(renderWgsl, [prelude])
 const inspectCell = wgslFn(inspectWgsl, [prelude])
+const stampBodies = wgslFn(stampWgsl, [prelude])
+const bodyForces = wgslFn(bodyForcesWgsl, [prelude])
+const bodyBuoyancy = wgslFn(bodyBuoyancyWgsl, [prelude])
+const solidMask = wgslFn(solidMaskWgsl, [prelude])
+const fireLasers = wgslFn(laserWgsl, [prelude])
+const checkPlacement = wgslFn(placementWgsl, [prelude])
+const carryRiders = wgslFn(carryWgsl, [prelude])
+const markShelter = wgslFn(shelterWgsl, [prelude])
+
+/** Cells across the bounds placement.wgsl checks (its PLACE_SIDE). */
+const PLACE_SIDE = 132
 
 /** Air cells are AIR_CELL x AIR_CELL sand cells (matches common.wgsl). */
 const AIR_CELL = 4
@@ -84,6 +105,44 @@ export class SandSim {
   private readonly inspectNode: ComputeNode
   /** Each air cell's gauge pressure filtered for liquids, and its recent net outflow (8 per air cell, see GAUGE_FAST). */
   private readonly gauges
+  /** Rigid bodies (written by bodies.ts, see common.wgsl), and the forces on them. */
+  private readonly bodies = instancedArray(MAX_BODIES * BODY_FLOATS, 'float')
+  /** The bodies as last stamped, so the stamp knows which rows they may have left (stamp.wgsl). */
+  private readonly bodiesBefore = instancedArray(MAX_BODIES * BODY_FLOATS, 'float')
+  private readonly bodyForceSums = instancedArray(MAX_BODIES * BODY_FORCE_INTS, 'int').toAtomic()
+  /** How hard each body presses on the ground (bodies.ts), against powders' bearing strength (stamp.wgsl). */
+  private readonly bodyPressures = instancedArray(MAX_BODIES, 'float')
+  /** Columns the stamp pass rewrites: where bodies are, or were last time. */
+  private readonly stampFrom = uniform(0, 'uint')
+  private readonly stampTo = uniform(0, 'uint')
+  /** The ground bodies collide with, one bit per cell (solidMask.wgsl). */
+  private readonly solidBits
+  readonly wordsPerColumn: number
+  private readonly stampNode: ComputeNode
+  private readonly bodyForcesNode: ComputeNode
+  private readonly bodyBuoyancyNode: ComputeNode
+  private readonly solidMaskNode: ComputeNode
+  /** Mining lasers (written by bodies.ts, see common.wgsl), and how far each ray got (laser.wgsl). */
+  private readonly lasers = instancedArray(MAX_LASERS * LASER_FLOATS, 'float')
+  private readonly laserHits = instancedArray(MAX_LASERS * LASER_RAYS, 'float')
+  private readonly laserCount = uniform(0, 'uint')
+  private readonly laserMine = uniform(0, 'uint')
+  private readonly laserNode: ComputeNode
+  /** A body to place, and how many cells would block it (placement.wgsl). */
+  private readonly probe = instancedArray(BODY_FLOATS, 'float')
+  private readonly placeOut = instancedArray(4, 'int').toAtomic()
+  private readonly placementPasses: ComputeNode[]
+  /** Bodies that moved sideways (slot, shift), for carrying what rests on them (carry.wgsl). */
+  private readonly carryList = instancedArray(MAX_BODIES * 2, 'int')
+  private readonly carryCount = uniform(0, 'uint')
+  private readonly carryFrom = uniform(0, 'uint')
+  private readonly carryTo = uniform(0, 'uint')
+  private readonly carryPasses: ComputeNode[]
+  /** Shelters bodies declare (bodies.ts packShelters), and the cells in them, out of the wind: one bit per cell (shelter.wgsl). */
+  private readonly shelters = instancedArray(MAX_BODIES * SHELTER_FLOATS, 'float')
+  private readonly shelterCount = uniform(0, 'uint')
+  private readonly shelterBits
+  private readonly shelterNode: ComputeNode
   private readonly view = uniform(0, 'uint')
   private readonly blowPressure = uniform(0, 'int')
   private paintCount = 0
@@ -93,14 +152,30 @@ export class SandSim {
   private readonly strokeEnd = uniform(new Vector2())
   private readonly radius = uniform(4)
   private readonly brushMaterial = uniform(0, 'uint')
-  private readonly flowOffset = uniform(0, 'uint')
-  private readonly flowPass = uniform(0, 'uint')
+  /** Per step: the seeds of the two Margolus passes, and the step count's parity (flow offsets). */
+  private readonly seedEven = uniform(0, 'uint')
+  private readonly seedOdd = uniform(0, 'uint')
+  private readonly stepParity = uniform(0, 'uint')
   private stepCount = 0
+  /**
+   * Every dispatch of a step, in order, run as one compute call: each call is a command
+   * buffer submitted on its own, which costs far more than most of these dispatches, so
+   * nothing in a step may depend on uniforms changing between them.
+   */
+  private readonly stepNodes: ComputeNode[]
+  /**
+   * Dispatches queued before the next step (carry, stamp, lasers), submitted with it in
+   * the same call; `flush` submits them without a step (while paused).
+   */
+  private pending: ComputeNode[] = []
+  /** Seeds of the stamp and the lasers, which are queued together (so they can't share `seed`). */
+  private readonly stampSeed = uniform(0, 'uint')
+  private readonly laserSeed = uniform(0, 'uint')
 
   private readonly stepEven: ComputeNode
   private readonly stepOdd: ComputeNode
-  /** Sideways liquid flow, one node per row modulo 3; dispatched together each pass. */
-  private readonly flowRows: ComputeNode[]
+  /** Sideways liquid flow: `maxSpread` passes, each three nodes (rows modulo 3). */
+  private readonly flowPasses: ComputeNode[]
   /** Static-pressure passes, fieldA -> fieldB and back. */
   private readonly pressurePasses: ComputeNode[]
   private readonly airPhases: ComputeNode[]
@@ -129,16 +204,20 @@ export class SandSim {
     this.hopsA = instancedArray(cellCount, 'uint')
     this.hopsB = instancedArray(cellCount, 'uint')
     this.gauges = instancedArray(airCount * 8, 'int')
+    this.wordsPerColumn = Math.ceil(height / 32)
+    this.solidBits = instancedArray(width * this.wordsPerColumn, 'uint')
+    this.shelterBits = instancedArray(width * this.wordsPerColumn, 'uint')
 
     const step = (offset: number) =>
       stepBlock({
         cells: this.cells,
         air: this.airA,
+        shelter: this.shelterBits,
         index: instanceIndex,
         size,
         airSize,
         offset: uint(offset),
-        seed: this.seed,
+        seed: offset === 0 ? this.seedEven : this.seedOdd,
       }).compute(blockCount, [64])
 
     this.stepEven = step(0)
@@ -192,17 +271,20 @@ export class SandSim {
     }).compute(airCount, [64])
 
     const pairCount = (Math.floor(width / 2) + 1) * Math.ceil(height / 3)
-    this.flowRows = [0, 1, 2].map((rowPhase) =>
-      flowPair({
-        cells: this.cells,
-        field: this.fieldA,
-        index: instanceIndex,
-        size,
-        offset: this.flowOffset,
-        rowPhase: uint(rowPhase),
-        passIndex: this.flowPass,
-      }).compute(pairCount, [64]),
-    )
+    // Pair offsets alternate between passes and steps: (pass + step count) & 1.
+    this.flowPasses = Array.from({ length: maxSpread }, (_, pass) =>
+      [0, 1, 2].map((rowPhase) =>
+        flowPair({
+          cells: this.cells,
+          field: this.fieldA,
+          index: instanceIndex,
+          size,
+          offset: uint(pass).add(this.stepParity).bitAnd(1),
+          rowPhase: uint(rowPhase),
+          passIndex: uint(pass),
+        }).compute(pairCount, [64]),
+      ),
+    ).flat()
 
     this.paintNode = paintStroke({
       cells: this.cells,
@@ -239,6 +321,87 @@ export class SandSim {
       at: this.inspectAt,
     }).compute(1, [1])
 
+    this.stampNode = stampBodies({
+      cells: this.cells,
+      bodies: this.bodies,
+      before: this.bodiesBefore,
+      pressures: this.bodyPressures,
+      forces: this.bodyForceSums,
+      index: instanceIndex,
+      size,
+      range: uvec2(this.stampFrom, this.stampTo),
+      seed: this.stampSeed,
+    }).compute(Math.max(width, MAX_BODIES * BODY_FORCE_INTS), [64])
+
+    this.bodyForcesNode = bodyForces({
+      cells: this.cells,
+      bodies: this.bodies,
+      forces: this.bodyForceSums,
+      index: instanceIndex,
+      size,
+    }).compute(cellCount, [64])
+
+    this.bodyBuoyancyNode = bodyBuoyancy({
+      cells: this.cells,
+      bodies: this.bodies,
+      forces: this.bodyForceSums,
+      index: instanceIndex,
+      size,
+    }).compute(cellCount, [64])
+
+    this.solidMaskNode = solidMask({
+      cells: this.cells,
+      bodies: this.bodies,
+      mask: this.solidBits,
+      index: instanceIndex,
+      size,
+    }).compute(width, [64])
+
+    this.laserNode = fireLasers({
+      cells: this.cells,
+      lasers: this.lasers,
+      hits: this.laserHits,
+      index: instanceIndex,
+      size,
+      count: this.laserCount,
+      seed: this.laserSeed,
+      mine: this.laserMine,
+    }).compute(MAX_LASERS * LASER_RAYS, [64])
+
+    this.placementPasses = [0, 1].map((phase) =>
+      checkPlacement({
+        cells: this.cells,
+        probe: this.probe,
+        out: this.placeOut,
+        index: instanceIndex,
+        size,
+        phase: uint(phase),
+      }).compute(phase === 0 ? 1 : PLACE_SIDE * PLACE_SIDE, [64]),
+    )
+
+    this.shelterNode = markShelter({
+      shelters: this.shelters,
+      mask: this.shelterBits,
+      index: instanceIndex,
+      size,
+      count: this.shelterCount,
+    }).compute(width, [64])
+
+    // Uses fieldB as scratch, like the crumble passes.
+    this.carryPasses = [0, 1].map((phase) =>
+      carryRiders({
+        cells: this.cells,
+        bodies: this.bodies,
+        carry: this.carryList,
+        riders: this.fieldB,
+        index: instanceIndex,
+        size,
+        count: this.carryCount,
+        range: uvec2(this.carryFrom, this.carryTo),
+        phase: uint(phase),
+      }).compute(phase === 0 ? cellCount : height, [64]),
+    )
+
     this.fillNode = fillLevel({
       cells: this.cells,
       air: this.airA,
@@ -251,6 +414,14 @@ export class SandSim {
       mode: this.mode,
     }).compute(Math.max(cellCount, airCount * 8), [64])
 
+    // A step, in order: AIR_SUBSTEPS air substeps (flow update and move; the first also
+    // re-measures volumes), the shelters, two Margolus passes, the static-pressure passes,
+    // then the sideways flow passes.
+    const [measure, move, flow] = this.airPhases
+    const air = [measure, move, ...Array.from({ length: AIR_SUBSTEPS - 1 }, () => [flow, move]).flat()]
+    const pressure = Array.from({ length: PRESSURE_PASSES / 2 }, () => this.pressurePasses).flat()
+    this.stepNodes = [...air, this.shelterNode, this.stepEven, this.stepOdd, ...pressure, ...this.flowPasses]
+
     this.material = new MeshBasicNodeMaterial()
     // wgslFn calls are untyped in TSL's typings; sandColor returns vec4f.
     this.material.colorNode = sandColor({
@@ -258,6 +429,10 @@ export class SandSim {
       gauges: this.gauges,
       field: this.fieldA,
       hops: this.hopsA,
+      bodies: this.bodies,
+      lasers: this.lasers,
+      laserHits: this.laserHits,
+      laserCount: this.laserCount,
       uv: uv(),
       size,
       airSize,
@@ -267,33 +442,124 @@ export class SandSim {
   }
 
   /**
-   * One simulation step: AIR_SUBSTEPS air substeps (dynamic pressure), two Margolus passes with
+   * One simulation step: AIR_SUBSTEPS air substeps (dynamic pressure), marking the cells
+   * in shelters as out of the wind, two Margolus passes with
    * alternating block offsets (falling, sliding, wind), PRESSURE_PASSES static-pressure
    * passes, then `maxSpread` sideways flow passes.
    * Every random choice derives from the step count, so runs are reproducible.
    */
   step(renderer: WebGPURenderer) {
-    let pass = 0
-    const nextSeed = () => (this.seed.value = hashSeed(this.stepCount * 64 + pass++))
-
-    const [measure, move, flow] = this.airPhases
-    renderer.compute([measure, move])
-    for (let s = 1; s < AIR_SUBSTEPS; s++) renderer.compute([flow, move])
-
-    nextSeed()
-    renderer.compute(this.stepEven)
-    nextSeed()
-    renderer.compute(this.stepOdd)
-
-    for (let p = 0; p < PRESSURE_PASSES; p += 2) renderer.compute(this.pressurePasses)
-
-    for (let flow = 0; flow < maxSpread; flow++) {
-      nextSeed()
-      this.flowPass.value = flow
-      this.flowOffset.value = (flow + this.stepCount) & 1
-      renderer.compute(this.flowRows)
-    }
+    this.seedEven.value = hashSeed(this.stepCount * 64)
+    this.seedOdd.value = hashSeed(this.stepCount * 64 + 1)
+    this.stepParity.value = this.stepCount & 1
+    renderer.compute([...this.pending, ...this.stepNodes])
+    this.pending = []
     this.stepCount++
+  }
+
+  /** Submit what's queued for the next step (carry, stamp, lasers) without stepping, as while paused. */
+  flush(renderer: WebGPURenderer) {
+    if (this.pending.length === 0) return
+    renderer.compute(this.pending)
+    this.pending = []
+  }
+
+  /**
+   * Upload the rigid bodies (BODY_FLOATS per slot) and how hard each presses on the
+   * ground, and stamp them into the grid, rewriting columns `from` to `to` (exclusive).
+   * Also clears the force sums. Queued: submitted with the next step, or by `flush`.
+   */
+  stampBodies(data: Float32Array, pressures: Float32Array, from: number, to: number) {
+    const attribute = this.bodies.value
+    const before = this.bodiesBefore.value
+    ;(before.array as Float32Array).set(attribute.array as Float32Array)
+    before.needsUpdate = true
+    ;(attribute.array as Float32Array).set(data)
+    attribute.needsUpdate = true
+    const pressure = this.bodyPressures.value
+    ;(pressure.array as Float32Array).set(pressures)
+    pressure.needsUpdate = true
+    this.stampFrom.value = from
+    this.stampTo.value = to
+    this.stampSeed.value = hashSeed(this.stepCount * 64 + 62)
+    this.pending.push(this.stampNode)
+  }
+
+  /**
+   * Pack the ground bodies collide with, and (when there are any bodies) sum up the
+   * forces on them since the last stamp.
+   */
+  measureBodies(renderer: WebGPURenderer, forces: boolean) {
+    renderer.compute(forces ? [this.bodyForcesNode, this.bodyBuoyancyNode, this.solidMaskNode] : this.solidMaskNode)
+  }
+
+  /** Forces on the bodies, from the last measureBodies (BODY_FORCE_INTS per slot, see common.wgsl). */
+  async readBodyForces(renderer: WebGPURenderer) {
+    return new Int32Array(await renderer.getArrayBufferAsync(this.bodyForceSums.value))
+  }
+
+  /** The ground bodies collide with, from the last measureBodies (column-major bits, see solidMask.wgsl). */
+  async readSolidMask(renderer: WebGPURenderer) {
+    return new Uint32Array(await renderer.getArrayBufferAsync(this.solidBits.value))
+  }
+
+  /** Upload the shelters (`count` of them, SHELTER_FLOATS each, see shelter.wgsl), for the next steps. */
+  setShelters(data: Float32Array, count: number) {
+    this.shelterCount.value = count
+    if (count === 0) return
+    const attribute = this.shelters.value
+    ;(attribute.array as Float32Array).set(data)
+    attribute.needsUpdate = true
+  }
+
+  /**
+   * Carry what rests on the bodies that moved sideways along with them (`count` of them in
+   * `data`: slot and shift, see carry.wgsl), looking at columns `from` to `to`. Run before
+   * stamping the bodies where they've moved to. Queued, like the stamp.
+   */
+  carry(data: Int32Array, count: number, from: number, to: number) {
+    if (count === 0) return
+    const attribute = this.carryList.value
+    ;(attribute.array as Int32Array).set(data)
+    attribute.needsUpdate = true
+    this.carryCount.value = count
+    this.carryFrom.value = from
+    this.carryTo.value = to
+    this.pending.push(...this.carryPasses)
+  }
+
+  /**
+   * Upload the mining lasers (`count` of them, LASER_FLOATS each) and fire them: they
+   * decompose the stone they hit into sand when `mine`, else only trace their beams
+   * (for drawing while paused). Run after stamping the bodies, before a step. Queued,
+   * like the stamp.
+   */
+  fireLasers(data: Float32Array, count: number, mine: boolean) {
+    this.laserCount.value = count
+    if (count === 0) return
+    const attribute = this.lasers.value
+    ;(attribute.array as Float32Array).set(data)
+    attribute.needsUpdate = true
+    this.laserMine.value = mine ? 1 : 0
+    this.laserSeed.value = hashSeed(this.stepCount * 64 + 63)
+    this.pending.push(this.laserNode)
+  }
+
+  /**
+   * How many cells would block a placeable object (one body, BODY_FLOATS floats, see
+   * placement.wgsl); 0 when it fits.
+   */
+  async checkPlacement(renderer: WebGPURenderer, data: Float32Array) {
+    const attribute = this.probe.value
+    ;(attribute.array as Float32Array).set(data)
+    attribute.needsUpdate = true
+    renderer.compute(this.placementPasses)
+    return new Int32Array(await renderer.getArrayBufferAsync(this.placeOut.value))[0]
+  }
+
+  /** Crumble stone thinner than 4 cells to sand (crumble.wgsl), after painting or mining. */
+  crumble(renderer: WebGPURenderer) {
+    renderer.compute(this.crumblePasses)
   }
 
   /** Paint a stroke between two grid positions (cells, y down). */
@@ -346,6 +612,9 @@ export class SandSim {
     this.mode.value = what === 'level' ? 1 : 0
     renderer.compute(this.fillNode)
     renderer.compute(this.crumblePasses)
+    // The fill wiped the bodies' cells: forget where they were stamped, so the next stamp
+    // (which skips columns where nothing changed) draws them all again.
+    ;(this.bodies.value.array as Float32Array).fill(0)
   }
 
   dispose() {

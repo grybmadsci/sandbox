@@ -2,7 +2,8 @@
 // (MAT_*, KIND_*, MATERIAL_*) are generated in materials.ts and placed before this.
 //
 // Cell layout (u32): bits 0-7 material id, bits 8-15 per-grain shade, bit 16 flow
-// direction (0 = right, 1 = left), bits 17-31 liquid credit (see cellCredit). The whole
+// direction (0 = right, 1 = left), bits 17-31 liquid credit (see cellCredit) or, in
+// stone, laser damage (see stoneDamage). The whole
 // cell moves together, so all of it travels with the grain.
 // Grid y grows downward (row 0 is the top); gravity is +y.
 //
@@ -37,6 +38,17 @@ fn cellCredit(cell: u32) -> u32 {
 
 fn withCredit(cell: u32, credit: u32) -> u32 {
   return (cell & 0x1ffffu) | (credit << 17u);
+}
+
+// Stone keeps the damage a mining laser has done to it (laser.wgsl), in
+// 1/LASER_DAMAGE_ONE of a full step's hit, where liquids keep credit; at
+// LASER_BREAK_DAMAGE it decomposes into sand.
+fn stoneDamage(cell: u32) -> u32 {
+  return cell >> 17u;
+}
+
+fn withStoneDamage(cell: u32, damage: u32) -> u32 {
+  return (cell & 0x1ffffu) | (damage << 17u);
 }
 
 // Pressure field, one u32 per liquid cell (written by pressure.wgsl), FIELD_NONE elsewhere:
@@ -112,6 +124,12 @@ fn flipDirection(cell: u32) -> u32 {
   return cell ^ (1u << 16u);
 }
 
+// A cell's bit in a column-major mask of one bit per cell (shelter.wgsl, solidMask.wgsl).
+fn maskBit(mask: ptr<storage, array<u32>, read_write>, p: vec2i, size: vec2u) -> bool {
+  let words = (size.y + 31u) / 32u;
+  return (((*mask)[u32(p.x) * words + u32(p.y) / 32u] >> (u32(p.y) % 32u)) & 1u) != 0u;
+}
+
 fn inGrid(p: vec2i, size: vec2u) -> bool {
   return p.x >= 0 && p.y >= 0 && p.x < i32(size.x) && p.y < i32(size.y);
 }
@@ -170,6 +188,13 @@ fn slidesDiagonally(top: u32, bottom: u32, belowTop: u32, aboveBottom: u32) -> b
     && !sinksInto(top, belowTop) && cellKind(aboveBottom) != KIND_SOLID;
   let rises = cellKind(bottom) == KIND_GAS && !sinksInto(aboveBottom, bottom) && cellKind(belowTop) != KIND_SOLID;
   return falls || rises;
+}
+
+// Chance (16-bit) that `top` and the diagonally adjacent `bottom` swap when they could:
+// the falling one's (MATERIAL_SLIDE), or the rising gas's.
+fn slideChance(top: u32, bottom: u32) -> u32 {
+  let falls = cellKind(top) == KIND_POWDER || cellKind(top) == KIND_LIQUID;
+  return MATERIAL_SLIDE[cellMaterial(select(bottom, top, falls))];
 }
 
 // Does wind of `speed` (fixed point) push `a` into neighbouring `b` this time?
@@ -371,4 +396,126 @@ fn pressureColor(t: f32) -> vec3f {
   let x = t * 4.0;
   let k = min(u32(x), 3u);
   return mix(stops[k], stops[k + 1u], x - f32(k));
+}
+
+// Rigid bodies (bodies.ts) are stamped into the grid as MAT_BODY cells whose shade bits
+// hold the body's slot. The CPU writes each slot as BODY_FLOATS floats, in grid units
+// (y down):
+//   0-1 position, 2-3 rotation (cos, sin), 4 radius, 5 core point count (0 = free slot),
+//   6-9 the cells it may cover (min x, min y, max x, max y), 10 static (1) or dynamic (0),
+//   11 device (DEVICE_*: what a placeable object does), 12-14 colour (sRGB), 15 the
+//   device's reach (a laser fires from this far along its local +x), 16-31 up to 8 core
+//   points (local).
+// A body is every point within `radius` of the convex hull of its core points: one point
+// is a ball, two a capsule, more a rounded polygon. A cell belongs to it when the cell's
+// centre does.
+const MAX_BODIES: u32 = 64u;
+const BODY_FLOATS: u32 = 32u;
+const BODY_POINTS: u32 = 8u;
+// Per slot, bodyForces.wgsl and bodyBuoyancy.wgsl add up (atomically, see BODY_*) the
+// push on the body and its torque about the body's position, in 1/BODY_FORCE_ONE cells'
+// weight of water; and how many of its cells are submerged in liquid, of how many.
+const BODY_FORCE_INTS: u32 = 8u;
+const BODY_FORCE_X: u32 = 0u;
+const BODY_FORCE_Y: u32 = 1u;
+const BODY_TORQUE: u32 = 2u;
+const BODY_SUBMERGED: u32 = 3u;
+const BODY_CELLS: u32 = 4u;
+const BODY_FORCE_ONE: f32 = 4.0;
+// How far up a pile of powder resting on a body is weighed.
+const BODY_MAX_LOAD: i32 = 128;
+
+// Shelters (shelter.wgsl): regions bodies declare in their own frame, kept out of the wind.
+const SHELTER_FLOATS: u32 = 12u;
+
+// Placeable objects (objects.ts) are static bodies with a device.
+const DEVICE_NONE: u32 = 0u;
+const DEVICE_LASER: u32 = 1u;
+
+// Mining lasers (laser.wgsl). The CPU writes each as LASER_FLOATS floats: 0-1 where the
+// beam starts, 2-3 its direction (unit), 4 its body's slot, 5 its range (cells). Each
+// fires LASER_RAYS parallel rays, a cell apart; laser.wgsl writes how far each got.
+const MAX_LASERS: u32 = 16u;
+const LASER_FLOATS: u32 = 8u;
+const LASER_RAYS: u32 = 9u;
+// Steps of a ray's hits that break a stone cell: 3 seconds at 120 steps a second.
+const LASER_BREAK_STEPS: u32 = 360u;
+// A full step's hit, in damage units (fine enough for weaker hits deeper in the stone).
+// The most damage a cell holds, 360 * 64, fits in bits 17-31.
+const LASER_DAMAGE_ONE: u32 = 64u;
+const LASER_BREAK_DAMAGE: u32 = LASER_BREAK_STEPS * LASER_DAMAGE_ONE;
+
+struct Body {
+  position: vec2f,
+  rotation: vec2f,
+  radius: f32,
+  count: u32,
+  lo: vec2f,
+  hi: vec2f,
+  isStatic: bool,
+  device: u32,
+  color: vec3f,
+  reach: f32,
+  points: array<vec2f, BODY_POINTS>,
+}
+
+fn bodyFromFloats(f: array<f32, BODY_FLOATS>) -> Body {
+  var b: Body;
+  b.position = vec2f(f[0], f[1]);
+  b.rotation = vec2f(f[2], f[3]);
+  b.radius = f[4];
+  b.count = u32(f[5]);
+  b.lo = vec2f(f[6], f[7]);
+  b.hi = vec2f(f[8], f[9]);
+  b.isStatic = f[10] != 0.0;
+  b.device = u32(f[11]);
+  b.color = vec3f(f[12], f[13], f[14]);
+  b.reach = f[15];
+  for (var i = 0u; i < BODY_POINTS; i++) {
+    b.points[i] = vec2f(f[16u + i * 2u], f[17u + i * 2u]);
+  }
+  return b;
+}
+
+fn loadBody(bodies: ptr<storage, array<f32>, read_write>, slot: u32) -> Body {
+  var f: array<f32, BODY_FLOATS>;
+  for (var i = 0u; i < BODY_FLOATS; i++) {
+    f[i] = (*bodies)[slot * BODY_FLOATS + i];
+  }
+  return bodyFromFloats(f);
+}
+
+// A world point (grid units) in the body's own frame.
+fn bodyLocal(b: Body, p: vec2f) -> vec2f {
+  let d = p - b.position;
+  return vec2f(b.rotation.x * d.x + b.rotation.y * d.y, b.rotation.x * d.y - b.rotation.y * d.x);
+}
+
+// Distance from a local point to the convex hull of the body's core points (0 inside).
+fn bodyCoreDistance(b: Body, q: vec2f) -> f32 {
+  var nearest = 1e9;
+  var inside = b.count >= 3u;
+  var turn = 0.0;
+  for (var i = 0u; i < b.count; i++) {
+    let a = b.points[i];
+    let e = b.points[(i + 1u) % b.count] - a;
+    let t = clamp(dot(q - a, e) / max(dot(e, e), 1e-6), 0.0, 1.0);
+    nearest = min(nearest, length(q - a - e * t));
+    // Inside a convex polygon, q is on the same side of every edge.
+    let side = e.x * (q.y - a.y) - e.y * (q.x - a.x);
+    if (turn == 0.0) {
+      turn = sign(side);
+    } else if (side * turn < 0.0) {
+      inside = false;
+    }
+  }
+  return select(nearest, 0.0, inside);
+}
+
+fn bodyContains(b: Body, p: vec2f) -> bool {
+  return bodyCoreDistance(b, bodyLocal(b, p)) <= b.radius;
+}
+
+fn bodyCell(slot: u32) -> u32 {
+  return MAT_BODY | (slot << 8u);
 }

@@ -8,6 +8,7 @@
 fn stepBlock(
   cells: ptr<storage, array<u32>, read_write>,
   air: ptr<storage, array<i32>, read_write>,
+  shelter: ptr<storage, array<u32>, read_write>,
   index: u32,
   size: vec2u,
   airSize: vec2u,
@@ -27,9 +28,12 @@ fn stepBlock(
   // `var` (not `let`) so the arrays can be indexed with a loop variable everywhere.
   var p = array<vec2i, 4>(origin, origin + vec2i(1, 0), origin + vec2i(0, 1), origin + vec2i(1, 1));
   var c = array<u32, 4>(MAT_STONE, MAT_STONE, MAT_STONE, MAT_STONE);
+  // Cells in a shelter (a truck's bucket, shelter.wgsl) are out of the wind, with the rest of their block.
+  var sheltered = false;
   for (var i = 0u; i < 4u; i++) {
     if (inGrid(p[i], size)) {
       c[i] = (*cells)[gridIndex(p[i], size)];
+      sheltered = sheltered || maskBit(shelter, p[i], size);
     }
   }
   var before = c;
@@ -50,18 +54,18 @@ fn stepBlock(
     t = c[1]; c[1] = c[3]; c[3] = t;
   }
 
-  // 2. Slide diagonally when blocked: falling cells down, gases up. Random order avoids a left/right bias.
-  let diagonalChance = 55705u;  // 0.85
+  // 2. Slide diagonally when blocked: falling cells down, gases up, as readily as the
+  // falling (or else rising) material slides. Random order avoids a left/right bias.
   let leftFirst = (r & 0x80000000u) != 0u;
   for (var i = 0u; i < 2u; i++) {
     if ((i == 0u) == leftFirst) {
       // top-left <-> bottom-right
-      if (slidesDiagonally(c[0], c[3], c[2], c[1]) && chance16(hashPcg(r + 1u), diagonalChance)) {
+      if (slidesDiagonally(c[0], c[3], c[2], c[1]) && chance16(hashPcg(r + 1u), slideChance(c[0], c[3]))) {
         t = c[0]; c[0] = c[3]; c[3] = t;
       }
     } else {
       // top-right <-> bottom-left
-      if (slidesDiagonally(c[1], c[2], c[3], c[0]) && chance16(hashPcg(r + 2u), diagonalChance)) {
+      if (slidesDiagonally(c[1], c[2], c[3], c[0]) && chance16(hashPcg(r + 2u), slideChance(c[1], c[2]))) {
         t = c[1]; c[1] = c[2]; c[2] = t;
       }
     }
@@ -71,7 +75,7 @@ fn stepBlock(
   let a = airIndex((origin + 1) / i32(AIR_CELL), airSize);
   let wind = vec2i(airWind((*air)[a + AIR_VX]), airWind((*air)[a + AIR_VY]));
   let speed = vec2u(abs(wind));
-  if (speed.x != 0u) {
+  if (speed.x != 0u && !sheltered) {
     let right = wind.x > 0;
     for (var row = 0u; row < 4u; row += 2u) {
       let mover = select(row + 1u, row, right);
@@ -81,7 +85,7 @@ fn stepBlock(
       }
     }
   }
-  if (speed.y != 0u) {
+  if (speed.y != 0u && !sheltered) {
     let down = wind.y > 0;
     for (var col = 0u; col < 2u; col++) {
       let mover = select(col + 2u, col, down);

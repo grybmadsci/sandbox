@@ -21,6 +21,10 @@ fn paintStroke(
     return;
   }
 
+  // Rigid bodies own their cells (stamp.wgsl); the eraser removes whole bodies (bodies.ts).
+  if (cellMaterial((*cells)[index]) == MAT_BODY) {
+    return;
+  }
   if (materialId == MAT_EMPTY) {
     (*cells)[index] = MAT_EMPTY;
     return;

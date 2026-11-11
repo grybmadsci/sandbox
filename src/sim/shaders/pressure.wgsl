@@ -54,10 +54,8 @@ fn pressureColumn(
     }
     let first = (*cells)[u32(y) * w + index];
     if (cellKind(first) != KIND_LIQUID) {
-      let i = u32(y) * w + index;
-      if ((*fieldOut)[i] != FIELD_NONE) {
-        (*fieldOut)[i] = FIELD_NONE;
-      }
+      // Written blind: in this serial walk a write is far cheaper than a read to check it.
+      (*fieldOut)[u32(y) * w + index] = FIELD_NONE;
       y++;
       continue;
     }

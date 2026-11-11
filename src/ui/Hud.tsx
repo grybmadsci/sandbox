@@ -5,11 +5,16 @@ import type { Inspection } from '../sim/inspect'
 
 const toCss = ([r, g, b]: readonly number[]) => `rgb(${r * 255}, ${g * 255}, ${b * 255})`
 
-/** Palette swatch: the material color, a dashed box for the eraser, a ring for air, a dashed ring for the vacuum. */
+/** Palette swatch: the material color, a dashed box for the eraser, a ring for air, a dashed ring for the vacuum, the body's colour and shape, a laser's red tip, a vehicle's yellow body and dark wheels. */
 const swatchStyle = (tool: Tool) => {
   if (tool === 'AIR') return { borderRadius: 5, border: '2px solid #9fd3ff' }
   if (tool === 'VACUUM') return { borderRadius: 5, border: '2px dashed #9fd3ff' }
   if (tool === 'INSPECT') return { borderRadius: 5, border: '2px solid #fff' }
+  if (tool === 'BOX') return { background: '#9e6e3d' }
+  if (tool === 'BALL') return { borderRadius: 5, background: '#c73833' }
+  if (tool === 'BEAM') return { height: 4, background: '#808fa3' }
+  if (tool === 'VEHICLE') return { borderRadius: '2px 2px 5px 5px', background: '#dba329', borderBottom: '3px solid #2b2b30' }
+  if (tool === 'LASER') return { height: 6, background: 'linear-gradient(90deg, #4d5259 70%, #f2382a 70%)' }
   const m = materialByKey[tool]
   if (m.kind === 'empty') return { border: '1px dashed #fff' }
   return { background: toCss(m.color) }
@@ -89,6 +94,12 @@ export function Hud() {
       </div>
       <div style={{ opacity: 0.6 }}>
         Left drag: paint (Air: hold to pump pressure, drag to blow; Vacuum: hold to take air out) · [ ]: brush size
+        <br />
+        Box / Ball / Beam: drag to place (Shift: static box or ball, loose wooden beam) · Eraser removes bodies
+        <br />
+        Mining laser: drag from where it goes toward what to mine (fits in air or liquid, not over stone, sand or bodies)
+        <br />
+        Vehicle: click to place (Shift: facing left) · Z / X: drive left / right · hold T: tip the bucket
         <br />
         P: pressure view · Space: pause · R: reset level · C: clear
         <br />

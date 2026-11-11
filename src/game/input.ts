@@ -1,5 +1,5 @@
 import { useEffect } from 'react'
-import { tools } from './tools'
+import { letterKeys, tools, type Tool } from './tools'
 import { useSandbox } from './store'
 
 /** Currently held keys, by KeyboardEvent.code. Read every frame by the camera. */
@@ -15,6 +15,10 @@ export const input = {
   zoomIn: () => isHeld('KeyE', 'Equal'),
   zoomOut: () => isHeld('KeyQ', 'Minus'),
   fast: () => isHeld('ShiftLeft', 'ShiftRight'),
+  /** Vehicles: drive left / right, and tip their buckets. */
+  driveLeft: () => isHeld('KeyZ'),
+  driveRight: () => isHeld('KeyX'),
+  tip: () => isHeld('KeyT'),
 }
 
 /** Tracks held keys and handles one-shot hotkeys. */
@@ -25,9 +29,9 @@ export function useInput() {
       if (e.repeat) return
 
       const game = useSandbox.getState()
-      if (e.code === 'KeyI') game.select('INSPECT')
+      for (const [tool, code] of Object.entries(letterKeys)) if (e.code === code) game.select(tool as Tool)
       const index = e.key === '0' ? 9 : Number(e.key) - 1
-      if (Number.isInteger(index) && index >= 0 && index < tools.length) game.select(tools[index])
+      if (Number.isInteger(index) && index >= 0 && index < 10) game.select(tools[index])
       if (e.code === 'BracketLeft') game.resizeBrush(-1)
       if (e.code === 'BracketRight') game.resizeBrush(1)
       if (e.code === 'Space') {
