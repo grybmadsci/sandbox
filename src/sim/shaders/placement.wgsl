@@ -1,6 +1,6 @@
 // Whether a placeable object fits (SandSim.checkPlacement): counts the cells under the
 // body in `probe` (one body, BODY_FLOATS floats, see common.wgsl) that would block it:
-// stone, powder, other bodies, or outside the world. Air, gases and liquids don't (the
+// stone, powder, other bodies, outside the world, or in a chunk with no slot. Air, gases and liquids don't (the
 // stamp pushes them aside). Two passes, with one invocation per cell of the body's
 // bounds (at most PLACE_SIDE across):
 //
@@ -10,8 +10,8 @@ fn checkPlacement(
   cells: ptr<storage, array<u32>, read_write>,
   probe: ptr<storage, array<f32>, read_write>,
   out: ptr<storage, array<atomic<i32>>, read_write>,
+  table: ptr<storage, array<u32>, read_write>,
   index: u32,
-  size: vec2u,
   phase: u32,
 ) -> void {
   // Bounds of the largest body (MAX_BODY_SIZE) and then some.
@@ -32,11 +32,12 @@ fn checkPlacement(
   if (!bodyContains(b, vec2f(p) + 0.5)) {
     return;
   }
-  if (!inGrid(p, size)) {
+  let i = cellIndex(table, p);
+  if (i == CELL_NONE) {
     atomicAdd(&(*out)[0], 1);
     return;
   }
-  let kind = cellKind((*cells)[gridIndex(p, size)]);
+  let kind = cellKind((*cells)[i]);
   if (kind == KIND_SOLID || kind == KIND_POWDER) {
     atomicAdd(&(*out)[0], 1);
   }

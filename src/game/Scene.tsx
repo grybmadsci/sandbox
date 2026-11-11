@@ -1,15 +1,15 @@
+import { WORLD_SIZE } from '../world/config'
+import { spawnPoint } from '../world/worldgen'
 import { CameraRig } from './CameraRig'
 import { SandWorld } from './SandWorld'
-
-const WORLD_WIDTH = 2048
-const WORLD_HEIGHT = 512
 
 export function Scene() {
   return (
     <>
       <color attach="background" args={['#07080c']} />
-      <CameraRig worldWidth={WORLD_WIDTH} worldHeight={WORLD_HEIGHT} />
-      <SandWorld width={WORLD_WIDTH} height={WORLD_HEIGHT} />
+      {/* Starting a little above the ground at the spawn point, where the landmarks are. */}
+      <CameraRig worldWidth={WORLD_SIZE} worldHeight={WORLD_SIZE} startX={spawnPoint.x} startY={WORLD_SIZE - spawnPoint.y + 140} />
+      <SandWorld />
     </>
   )
 }

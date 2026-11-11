@@ -1,7 +1,8 @@
 // Mining lasers (objects.ts): each fires LASER_RAYS parallel rays, a cell apart, from
 // its tip along its direction. A ray passes through empty space, gases, liquids,
 // powder and its own body, and stops at the first stone cell, other body or the edge
-// of the world. It bites LASER_DEPTH cells deep: the stone it stops at takes a step's
+// of the world, or a chunk that isn't live (the chunks a beam reaches are woken,
+// ChunkManager.wakeSegment). It bites LASER_DEPTH cells deep: the stone it stops at takes a step's
 // damage, and the stone right behind it along the ray LASER_DEPTH_FALLOFF as much per
 // cell deeper; the two outermost rays (the band's edges) do LASER_EDGE_DAMAGE as much.
 // Stone decomposes after LASER_BREAK_STEPS of full hits (3 seconds): into sand, or
@@ -13,8 +14,8 @@ fn fireLasers(
   cells: ptr<storage, array<u32>, read_write>,
   lasers: ptr<storage, array<f32>, read_write>,
   hits: ptr<storage, array<f32>, read_write>,
+  table: ptr<storage, array<u32>, read_write>,
   index: u32,
-  size: vec2u,
   count: u32,
   seed: u32,
   mine: u32,
@@ -56,11 +57,11 @@ fn fireLasers(
   var hit = range;
   var bitten = 0u;
   for (var n = 0; n < LASER_MAX_CELLS && t < range; n++) {
-    if (!inGrid(p, size)) {
+    let i = liveCell(table, p);
+    if (i == CELL_NONE) {
       hit = min(hit, t);
       break;
     }
-    let i = gridIndex(p, size);
     let cell = (*cells)[i];
     let m = cellMaterial(cell);
     if (m == MAT_STONE) {
@@ -70,7 +71,7 @@ fn fireLasers(
         let hurt = u32(round(f32(LASER_DAMAGE_ONE) * pow(LASER_DEPTH_FALLOFF, f32(bitten)) * edge));
         let damage = stoneDamage(cell) + hurt;
         if (damage >= LASER_BREAK_DAMAGE) {
-          let h = hashPcg(i ^ hashPcg(seed));
+          let h = hashPcg(worldCellId(p) ^ hashPcg(seed));
           (*cells)[i] = select(makeCell(MAT_SAND, h >> 16u), MAT_EMPTY, chance16(h, LASER_VANISH_CHANCE));
         } else {
           (*cells)[i] = withStoneDamage(cell, damage);

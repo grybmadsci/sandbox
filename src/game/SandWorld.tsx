@@ -1,20 +1,13 @@
 import { use, useEffect, useMemo, useRef } from 'react'
 import { useFrame, useThree, type ThreeEvent } from '@react-three/fiber'
-import { BufferGeometry, Vector2, Vector3, type Line, type LineBasicMaterial, type LineSegments, type WebGPURenderer } from 'three/webgpu'
+import { BufferGeometry, Vector2, Vector3, type Line, type LineBasicMaterial, type LineSegments, type OrthographicCamera, type WebGPURenderer } from 'three/webgpu'
 import { SandSim } from '../sim/SandSim'
-import {
-  BODY_FLOATS,
-  BodyWorld,
-  ballBody,
-  beamBody,
-  bodyOutline,
-  boxBody,
-  levelBodies,
-  packBody,
-  rapierReady,
-  type Assembly,
-  type BodySpec,
-} from '../sim/bodies'
+import { BODY_FLOATS, BodyWorld, ballBody, beamBody, bodyOutline, boxBody, packBody, rapierReady, type Assembly, type BodySpec } from '../sim/bodies'
+import { ChunkManager, ChunkState } from '../world/ChunkManager'
+import { biomeAt, surfaceHeight } from '../world/biomes'
+import { WORLD_SEED, WORLD_SIZE } from '../world/config'
+import { Overview } from '../world/overview'
+import { decodeSave, encodeSave, readQuickSave, writeQuickSave } from '../world/save'
 import { laserObject, laserTip } from '../sim/objects'
 import { vehicleAssembly } from '../sim/vehicle'
 import { decodeInspection } from '../sim/inspect'
@@ -25,10 +18,12 @@ import { isObjectTool, isPlacingTool, type Tool } from './tools'
 
 const STEPS_PER_SECOND = 120
 const MAX_STEPS_PER_FRAME = 4
+/** Steps a frame while a new world settles (ChunkManager SETTLE_STEPS), behind the loading screen. */
+const SETTLE_STEPS_PER_FRAME = 8
 /** The inspect tool reads the cell under the cursor back from the GPU every this many frames. */
 const INSPECT_EVERY = 6
-
-type Props = { width: number; height: number }
+/** The world map in the HUD is refreshed every this many frames. */
+const MAP_EVERY = 15
 
 /**
  * What a drag from `a` to `b` places: a box corner to corner, a ball from its centre, a
@@ -65,19 +60,28 @@ function setLinePoints(line: Line, points: Vector3[]) {
 
 const isShiftHeld = () => heldKeys.has('ShiftLeft') || heldKeys.has('ShiftRight')
 
-/** The sand grid as a plane spanning (0, 0) to (width, height) in world units; one unit per cell. */
-export function SandWorld({ width, height }: Props) {
+/**
+ * The world, WORLD_SIZE cells square, one world unit per cell (y up; cells count y down
+ * from the top). SandSim draws the chunks on the GPU onto a plane over all of it; the
+ * overview behind shows through where they aren't. ChunkManager decides which chunks are
+ * where.
+ */
+export function SandWorld() {
   use(rapierReady)
   const renderer = useThree((s) => s.gl) as unknown as WebGPURenderer
-  const sim = useMemo(() => new SandSim(width, height), [width, height])
+  const camera = useThree((s) => s.camera) as OrthographicCamera
+  const size = useThree((s) => s.size)
+  const sim = useMemo(() => new SandSim(), [])
+  const overview = useMemo(() => new Overview(), [])
   useEffect(() => () => sim.dispose(), [sim])
+  useEffect(() => () => overview.dispose(), [overview])
   // Outlines of the bodies being dragged out, and where a laser will aim.
   const preview = useRef<LineSegments>(null)
   const aim = useRef<Line>(null)
 
   const state = useRef({
     accumulator: 0,
-    resetCount: -1, // -1 forces the level to be generated on the first frame
+    resetCount: -1, // -1 forces the world to be generated on the first frame
     clearCount: 0,
     painting: false,
     last: new Vector2(),
@@ -88,7 +92,6 @@ export function SandWorld({ width, height }: Props) {
     hover: null as Vector2 | null,
     inspecting: false,
     readingForces: false,
-    readingGround: false,
     /** Whether the object being dragged out fits (null: not checked yet), and whether a check is in flight. */
     fits: null as boolean | null,
     checkingFit: false,
@@ -97,18 +100,60 @@ export function SandWorld({ width, height }: Props) {
 
   // Made in an effect, so the Rapier world freed on unmount is never reused.
   const bodiesRef = useRef<BodyWorld>(null)
+  const worldRef = useRef<ChunkManager>(null)
   useEffect(() => {
-    const bodies = new BodyWorld(width, height, sim.wordsPerColumn, STEPS_PER_SECOND)
+    const bodies = new BodyWorld(WORLD_SIZE, WORLD_SIZE, STEPS_PER_SECOND)
+    const world = new ChunkManager(sim, renderer, bodies, overview, WORLD_SEED, STEPS_PER_SECOND)
     bodiesRef.current = bodies
-    state.current.resetCount = -1 // regenerate the level, with its bodies
+    worldRef.current = world
+    state.current.resetCount = -1 // generate the world, with its bodies
+    const game = useSandbox.getState()
+    const report = (what: string, run: () => Promise<void>) =>
+      run().then(
+        () => game.notify(what),
+        (error: Error) => game.notify(`${error.message}`),
+      )
+    const save = () => world.save({ x: camera.position.x, y: WORLD_SIZE - camera.position.y, zoom: camera.zoom }).then(encodeSave)
+    const load = async (file: Blob) => {
+      const saved = await decodeSave(file)
+      world.load(saved)
+      camera.position.set(saved.header.camera.x, WORLD_SIZE - saved.header.camera.y, camera.position.z)
+      camera.zoom = saved.header.camera.zoom
+      camera.updateProjectionMatrix()
+    }
+    useSandbox.setState({
+      persistence: {
+        quickSave: () => report('Saved.', async () => void (await writeQuickSave(await save()))),
+        quickLoad: () =>
+          report('Loaded.', async () => {
+            const file = await readQuickSave()
+            if (!file) throw new Error('Nothing saved yet.')
+            await load(file)
+          }),
+        exportFile: () =>
+          report('Saved to a file.', async () => {
+            const link = document.createElement('a')
+            link.href = URL.createObjectURL(await save())
+            link.download = `sandbox-${world.seed}.sandsave`
+            link.click()
+            setTimeout(() => URL.revokeObjectURL(link.href), 10_000)
+          }),
+        importFile: (file: File) => report('Loaded.', () => load(file)),
+      },
+    })
+    // For poking at the world from the console (and tests) in development.
+    if (import.meta.env.DEV) Object.assign(window, { sandbox: { world, sim, bodies, camera, renderer, save, load } })
     return () => {
+      useSandbox.setState({ persistence: null })
       bodiesRef.current = null
+      worldRef.current = null
+      world.dispose()
       bodies.dispose()
     }
-  }, [width, height, sim])
+  }, [sim, renderer, overview, camera])
 
-  // World point (y up) -> grid cell coordinates (y down).
-  const toGrid = (e: ThreeEvent<PointerEvent>, out: Vector2) => out.set(e.point.x, height - e.point.y)
+  // World point (y up) -> world cell coordinates (y down).
+  const toGrid = (e: ThreeEvent<PointerEvent>, out: Vector2) => out.set(e.point.x, WORLD_SIZE - e.point.y)
 
   const onPointerDown = (e: ThreeEvent<PointerEvent>) => {
     if (e.button !== 0 || useSandbox.getState().tool === 'INSPECT') return
@@ -153,26 +198,38 @@ export function SandWorld({ width, height }: Props) {
     const s = state.current
     const game = useSandbox.getState()
     const bodies = bodiesRef.current
-    if (!bodies) return
+    const world = worldRef.current
+    if (!bodies || !world) return
+    // Where the camera looks, and what it sees, in world cells.
+    const camX = camera.position.x
+    const camY = WORLD_SIZE - camera.position.y
+    const halfWidth = size.width / 2 / camera.zoom
+    const halfHeight = size.height / 2 / camera.zoom
 
     if (s.resetCount !== game.resetCount) {
       s.resetCount = game.resetCount
-      sim.fill(renderer, 'level')
-      bodies.clear()
-      for (const spec of levelBodies()) bodies.add(spec)
+      world.reset('terrain')
     }
     if (s.clearCount !== game.clearCount) {
       s.clearCount = game.clearCount
-      sim.fill(renderer, 'empty')
-      bodies.clear()
+      world.reset('empty')
     }
+    world.update({ x: camX, y: camY, x0: camX - halfWidth, y0: camY - halfHeight, x1: camX + halfWidth, y1: camY + halfHeight })
+    const loading = world.loading
+    if (loading?.phase !== game.loading?.phase || loading?.done !== game.loading?.done || loading?.total !== game.loading?.total) game.showLoading(loading)
 
     const dragging = s.painting && isPlacingTool(game.tool)
     if (s.painting && !isPlacingTool(game.tool)) {
-      if (game.tool === 'AIR') sim.blow(renderer, s.last, s.current, game.brushSize)
-      else if (game.tool === 'VACUUM') sim.vacuum(renderer, s.last, s.current, game.brushSize)
+      if (game.tool !== 'INSPECT') {
+        // Painting wakes the chunks it touches first, so they take the change and carry on from it.
+        const r = game.brushSize + 1
+        world.wakeRect(Math.min(s.last.x, s.current.x) - r, Math.min(s.last.y, s.current.y) - r, Math.max(s.last.x, s.current.x) + r, Math.max(s.last.y, s.current.y) + r)
+      }
+      const [from, to] = [s.last, s.current]
+      if (game.tool === 'AIR') sim.blow(renderer, from, to, game.brushSize)
+      else if (game.tool === 'VACUUM') sim.vacuum(renderer, from, to, game.brushSize)
       else if (game.tool !== 'INSPECT') {
-        sim.paint(renderer, s.last, s.current, game.brushSize, materialByKey[game.tool].id)
+        sim.paint(renderer, from, to, game.brushSize, materialByKey[game.tool].id)
         if (game.tool === 'EMPTY') bodies.removeNear(s.current.x, s.current.y, game.brushSize)
       }
       s.last.copy(s.current)
@@ -185,7 +242,7 @@ export function SandWorld({ width, height }: Props) {
         .then((ok) => (s.fits = s.painting ? ok : null))
         .finally(() => (s.checkingFit = false))
     }
-    const toWorld = ([x, y]: [number, number]) => new Vector3(x, height - y, 1)
+    const toWorld = ([x, y]: [number, number]) => new Vector3(x, WORLD_SIZE - y, 1)
     const line = preview.current
     if (line) {
       line.visible = placing !== null
@@ -216,19 +273,45 @@ export function SandWorld({ width, height }: Props) {
         .then((raw) => useSandbox.getState().inspect(decodeInspection(raw)))
         .finally(() => (s.inspecting = false))
     }
+    if (s.frame % MAP_EVERY === 0) {
+      const [cx, cy] = world.cameraChunkIndex ?? [0, 0]
+      const states = world.states()
+      game.showWorld({
+        seed: world.seed,
+        states,
+        camera: [cx, cy],
+        view: [camX - halfWidth, camY - halfHeight, camX + halfWidth, camY + halfHeight],
+        biome: world.mode === 'empty' ? 'None' : biomeAt(world.seed, camX, camY, surfaceHeight(world.seed, camX)).name,
+        live: states.filter((v) => v === ChunkState.Live).length,
+        loaded: states.filter((v) => v >= ChunkState.Frozen).length,
+        stored: states.filter((v) => v === ChunkState.Stored).length,
+        dormant: world.dormantCount,
+      })
+    }
+    overview.flush(performance.now())
 
     // Bodies move, carry what rests on them along, and are stamped into the grid; lasers
     // fire, then the grid steps around them. Paused, lasers only trace their beams.
+    // Bodies that move, and lasers that mine, wake the chunks they're in (or reach).
     const stamp = (mine: boolean) => {
       const packed = bodies.pack()
+      for (const [x0, y0, x1, y1] of bodies.takeMoved()) world.wakeRect(x0, y0, x1, y1)
       if (packed) sim.stampBodies(packed.data, packed.pressures, packed.from, packed.to)
       const shelters = bodies.packShelters()
       sim.setShelters(shelters.data, shelters.count)
       const lasers = bodies.packLasers()
+      if (mine) for (const [x0, y0, x1, y1] of lasers.beams) world.wakeSegment(x0, y0, x1, y1)
       sim.fireLasers(lasers.data, lasers.count, mine)
       return lasers.count > 0
     }
-    if (game.paused) {
+    if (loading?.phase === 'settling') {
+      // A new world settles behind the loading screen, a few steps a frame (bodies wait).
+      for (let k = 0; k < SETTLE_STEPS_PER_FRAME && world.loading; k++) {
+        sim.step(renderer)
+        world.afterStep()
+        world.settled()
+      }
+    } else if (game.paused || loading) {
       stamp(false)
       sim.flush(renderer)
     } else {
@@ -238,9 +321,10 @@ export function SandWorld({ width, height }: Props) {
       while (s.accumulator >= 1) {
         bodies.step()
         const carried = bodies.carries()
-        sim.carry(carried.data, carried.count, carried.from, carried.to)
+        sim.carry(carried.data, carried.count, carried.from, carried.to, carried.top, carried.bottom)
         mined = stamp(true) || mined
         sim.step(renderer)
+        world.afterStep()
         s.accumulator -= 1
       }
       // Mining can leave stone too thin to stand.
@@ -259,25 +343,22 @@ export function SandWorld({ width, height }: Props) {
         .then((raw) => bodies.applyForces(raw, measured))
         .finally(() => (s.readingForces = false))
     }
-    if (!s.readingGround) {
-      s.readingGround = true
-      sim
-        .readSolidMask(renderer)
-        .then((bits) => bodies.applyGround(bits))
-        .finally(() => (s.readingGround = false))
-    }
+    world.readGround()
   })
 
   return (
     <>
+      <mesh position={[WORLD_SIZE / 2, WORLD_SIZE / 2, -1]} material={overview.material}>
+        <planeGeometry args={[WORLD_SIZE, WORLD_SIZE]} />
+      </mesh>
       <mesh
-        position={[width / 2, height / 2, 0]}
+        position={[WORLD_SIZE / 2, WORLD_SIZE / 2, 0]}
         material={sim.material}
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
         onPointerOut={onPointerOut}
       >
-        <planeGeometry args={[width, height]} />
+        <planeGeometry args={[WORLD_SIZE, WORLD_SIZE]} />
       </mesh>
       <lineSegments ref={preview} visible={false}>
         <lineBasicMaterial color={PREVIEW_BODY} />

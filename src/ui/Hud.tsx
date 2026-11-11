@@ -1,7 +1,8 @@
 import { materialByKey } from '../sim/materials'
-import { useSandbox } from '../game/store'
+import { useSandbox, type Loading } from '../game/store'
 import { toolKey, toolName, tools, type Tool } from '../game/tools'
 import type { Inspection } from '../sim/inspect'
+import { WorldPanel } from './WorldPanel'
 
 const toCss = ([r, g, b]: readonly number[]) => `rgb(${r * 255}, ${g * 255}, ${b * 255})`
 
@@ -27,6 +28,7 @@ export function Hud() {
   const pressureView = useSandbox((s) => s.pressureView)
   const error = useSandbox((s) => s.error)
   const inspection = useSandbox((s) => s.inspection)
+  const loading = useSandbox((s) => s.loading)
   const select = useSandbox((s) => s.select)
 
   if (error) {
@@ -43,6 +45,9 @@ export function Hud() {
   }
 
   return (
+    <>
+    {loading && <LoadingScreen {...loading} />}
+    <WorldPanel />
     <div
       style={{
         position: 'absolute',
@@ -101,11 +106,46 @@ export function Hud() {
         <br />
         Vehicle: click to place (Shift: facing left) · Z / X: drive left / right · hold T: tip the bucket
         <br />
-        P: pressure view · Space: pause · R: reset level · C: clear
+        P: pressure view · Space: pause · R: regenerate the world · C: clear it
         <br />
         WASD / arrows or right-drag: pan (Shift = fast) · Wheel or Q/E: zoom · I: inspect
       </div>
       {selected === 'INSPECT' && <InspectPanel inspection={inspection} />}
+    </div>
+    </>
+  )
+}
+
+/** Over everything while the world gets ready: a spinner, and how many of the chunks around the camera are in, then how far settling has got. */
+function LoadingScreen({ phase, done, total }: Loading) {
+  return (
+    <div
+      style={{
+        position: 'absolute',
+        inset: 0,
+        zIndex: 10,
+        display: 'grid',
+        placeItems: 'center',
+        background: '#07080c',
+        textShadow: '0 1px 2px #000',
+      }}
+    >
+      <div style={{ display: 'grid', justifyItems: 'center', gap: 14 }}>
+        <div
+          style={{
+            width: 44,
+            height: 44,
+            borderRadius: '50%',
+            border: '4px solid #ffffff22',
+            borderTopColor: '#e8c37a',
+            animation: 'spin 0.9s linear infinite',
+          }}
+        />
+        <div>{phase === 'loading' ? 'Generating the world…' : 'Letting the world settle…'}</div>
+        <div style={{ opacity: 0.6, fontSize: 13, fontVariantNumeric: 'tabular-nums' }}>
+          {total === 0 ? 'Starting up' : phase === 'loading' ? `${done} of ${total} chunks` : `${Math.round((100 * done) / total)}%`}
+        </div>
+      </div>
     </div>
   )
 }
@@ -117,6 +157,9 @@ function InspectPanel({ inspection: i }: { inspection: Inspection | null }) {
   const rows: [string, string][] = []
   if (i) {
     rows.push(['Cell', `${i.x}, ${i.y}`])
+  }
+  if (i && !i.loaded) rows.push(['Contents', 'not loaded'])
+  else if (i) {
     // The empty material is named for its tool (Eraser); here it is just empty space.
     const name = i.material.kind === 'empty' ? 'Empty' : i.material.name
     rows.push(['Contents', `${name} (${i.material.kind}, density ${i.material.density})`])

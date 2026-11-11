@@ -18,35 +18,42 @@
 // closed and nothing decays. A pocket that liquid or sand fills keeps all its air,
 // compressed into the space that's left; a cell filled completely pushes its air out.
 // The only sources are the air brush and a fill (which starts still air at ambient
-// pressure).
+// pressure). The air of chunks that aren't live holds still and is left unwritten (`src`
+// and `dst` included, so it stays as it was), and their edges are closed like the world's.
+// Runs over the live chunks (LIST_LIVE), an invocation per air cell of each.
 fn airStep(
   cells: ptr<storage, array<u32>, read_write>,
   gauges: ptr<storage, array<i32>, read_write>,
   src: ptr<storage, array<i32>, read_write>,
   dst: ptr<storage, array<i32>, read_write>,
+  table: ptr<storage, array<u32>, read_write>,
   index: u32,
-  size: vec2u,
-  airSize: vec2u,
   phase: u32,
 ) -> void {
-  if (index >= airSize.x * airSize.y) {
+  let listed = index / (AIR_SIDE * AIR_SIDE);
+  if (listed >= listCount(table, LIST_LIVE)) {
     return;
   }
-  let ac = vec2i(i32(index % airSize.x), i32(index / airSize.x));
-  let i = index * 4u;
+  let chunk = listEntry(table, LIST_LIVE, listed);
+  let page = (*table)[chunk];
+  let k = index % (AIR_SIDE * AIR_SIDE);
+  let ac = chunkOrigin(chunk) / i32(AIR_CELL) + vec2i(i32(k % AIR_SIDE), i32(k / AIR_SIDE));
+  let i = slotAir(page, ac);
   let g = gaugeIndex(i);
   var mass = (*src)[i + AIR_MASS];
   var slot = (*src)[i + AIR_VOLUME];
   var volume = airVolume(slot);
 
-  // Neighbours: left, right, up, down. `inside` is false past the world edge.
+  // Neighbours: left, right, up, down. `inside` is false past the world edge, or in a
+  // chunk that isn't live (where `nj` is this cell, so reads stay in bounds).
   var dirs = array<vec2i, 4>(vec2i(-1, 0), vec2i(1, 0), vec2i(0, -1), vec2i(0, 1));
   var nj: array<u32, 4>;
   var inside: array<bool, 4>;
   for (var n = 0u; n < 4u; n++) {
     let q = ac + dirs[n];
-    inside[n] = q.x >= 0 && q.y >= 0 && q.x < i32(airSize.x) && q.y < i32(airSize.y);
-    nj[n] = airIndex(q, airSize);
+    let p = pageAt(table, q * i32(AIR_CELL));
+    inside[n] = pageLive(p);
+    nj[n] = select(i, slotAir(p, q), inside[n]);
   }
 
   if (phase == 1u) {
@@ -107,13 +114,14 @@ fn airStep(
     for (var dy = 0; dy < i32(AIR_CELL); dy++) {
       for (var dx = 0; dx < i32(AIR_CELL); dx++) {
         let p = ac * i32(AIR_CELL) + vec2i(dx, dy);
-        if (inGrid(p, size)) {
-          let k = cellKind((*cells)[gridIndex(p, size)]);
-          let below = p + vec2i(0, 1);
-          if (k == KIND_EMPTY || k == KIND_GAS) {
-            open += 1;
-          } else if ((k == KIND_LIQUID || k == KIND_POWDER) && inGrid(below, size)) {
-            let kb = cellKind((*cells)[gridIndex(below, size)]);
+        let k = cellKind((*cells)[slotCell(page, p)]);
+        if (k == KIND_EMPTY || k == KIND_GAS) {
+          open += 1;
+        } else if (k == KIND_LIQUID || k == KIND_POWDER) {
+          // (The row below the bottom one is in the chunk below, if it's there.)
+          let below = cellIndex(table, p + vec2i(0, 1));
+          if (below != CELL_NONE) {
+            let kb = cellKind((*cells)[below]);
             falling += select(0, 1, kb == KIND_EMPTY || kb == KIND_GAS);
           }
         }
@@ -163,11 +171,11 @@ fn airStep(
         // from its other upstream neighbour (diagonal to us).
         let theirs = vec2i((*src)[j + AIR_VX], (*src)[j + AIR_VY]);
         let diagonal = ac + select(vec2i(-1, 1), vec2i(1, -1), axis == 0u);
-        let inGridDiagonal = diagonal.x >= 0 && diagonal.y >= 0
-          && diagonal.x < i32(airSize.x) && diagonal.y < i32(airSize.y);
-        let d = airIndex(diagonal, airSize);
+        let diagonalPage = pageAt(table, diagonal * i32(AIR_CELL));
+        let liveDiagonal = pageLive(diagonalPage);
+        let d = select(i, slotAir(diagonalPage, diagonal), liveDiagonal);
         var spreadAhead = theirs.x + theirs.y - previous;
-        spreadAhead -= select(0, (*src)[d + AIR_VX + 1u - axis], inGridDiagonal);
+        spreadAhead -= select(0, (*src)[d + AIR_VX + 1u - axis], liveDiagonal);
         // Against each side's usual net outflow, so only changes are damped.
         let usualAhead = (*gauges)[gaugeIndex(j) + GAUGE_SPREAD];
         let usual = (*gauges)[g + GAUGE_SPREAD];

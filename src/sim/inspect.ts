@@ -1,11 +1,12 @@
 import { materials, type Material } from './materials'
+import { CHUNK_SIZE } from '../world/config'
 
 // Mirrors of constants in shaders/common.wgsl.
 const AIR_ROW = 256
 const AIR_AMBIENT = 1024 * AIR_ROW
 const AIR_ONE = 1024
 const HEAD_ONE = 16
-const HEAD_BASE = 1024
+const HEAD_BASE = 2048
 const HEAD_INF = 0xffff
 const DIST_INF = 0xfff
 const FIELD_NONE = 0xffffffff
@@ -14,6 +15,8 @@ const FIELD_NONE = 0xffffffff
 export type Inspection = {
   x: number
   y: number
+  /** Whether the cell's chunk is on the GPU (otherwise there's nothing else to tell). */
+  loaded: boolean
   material: Material
   /** Liquid in transit held by this cell (pressure credit), in cells. */
   credit: number
@@ -48,7 +51,8 @@ export function decodeInspection(raw: Int32Array): Inspection {
   let liquid: Inspection['liquid'] = null
   if (material.kind === 'liquid' && field !== FIELD_NONE && (field & 0xffff) !== HEAD_INF) {
     const hops = hopsPacked & 0xfff
-    const highest = ((field & 0xffff) - hops) / HEAD_ONE - HEAD_BASE
+    // Heads count from the top row of the cell's chunk.
+    const highest = ((field & 0xffff) - hops) / HEAD_ONE - HEAD_BASE + Math.floor(raw[4] / CHUNK_SIZE) * CHUNK_SIZE
     const distance = (field >>> 18) & 0xfff
     liquid = {
       pressure: Math.max(raw[4] - highest, 0),
@@ -77,6 +81,7 @@ export function decodeInspection(raw: Int32Array): Inspection {
   return {
     x: raw[3],
     y: raw[4],
+    loaded: raw[11] === 1,
     material,
     credit: material.kind === 'liquid' ? cell >>> 17 : 0,
     direction: (cell >> 16) & 1 ? 'left' : 'right',

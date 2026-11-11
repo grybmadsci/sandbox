@@ -3,42 +3,60 @@
 // The grid is partitioned into disjoint 2x2 blocks and each invocation owns one
 // block, so it can read and write it in place with no races. Alternate passes
 // shift the block grid by (1, 1) so material can cross block boundaries.
-// Cells outside the grid read as stone, so nothing leaves through the edges.
+// Cells outside the world read as stone, so nothing leaves through the edges.
 // Sideways flow and static pressure are separate kernels (flow.wgsl, pressure.wgsl).
+// Blocks touching a chunk that isn't live hold still, so nothing crosses into one.
+//
+// Runs over the live chunks (LIST_LIVE), BLOCKS_ACROSS x BLOCKS_ACROSS invocations each. A
+// block belongs to the chunk holding the cell 2 * (its column, its row) from the chunk's
+// first: its top-left cell in even passes, its bottom-right in odd ones. In odd passes the
+// blocks hanging over the world's right and bottom edges belong to the last chunks, the
+// spare column and row of invocations; other chunks' spares do nothing.
+
 fn stepBlock(
   cells: ptr<storage, array<u32>, read_write>,
   air: ptr<storage, array<i32>, read_write>,
   shelter: ptr<storage, array<u32>, read_write>,
+  table: ptr<storage, array<u32>, read_write>,
   index: u32,
-  size: vec2u,
-  airSize: vec2u,
   offset: u32,
   seed: u32,
 ) -> void {
-  let blocks = size / 2u + 1u;
-  if (index >= blocks.x * blocks.y) {
+  let n = index / (BLOCKS_ACROSS * BLOCKS_ACROSS);
+  if (n >= listCount(table, LIST_LIVE)) {
     return;
   }
-  let origin = vec2i(i32(index % blocks.x), i32(index / blocks.x)) * 2 - vec2i(i32(offset));
-  if (origin.x >= i32(size.x) || origin.y >= i32(size.y)) {
+  let first = chunkOrigin(listEntry(table, LIST_LIVE, n));
+  let k = index % (BLOCKS_ACROSS * BLOCKS_ACROSS);
+  let b = vec2i(i32(k % BLOCKS_ACROSS), i32(k / BLOCKS_ACROSS));
+  let spare = i32(CHUNK_SIZE / 2u);
+  let last = first + i32(CHUNK_SIZE) >= vec2i(i32(WORLD_SIZE));
+  if ((b.x == spare && (offset == 0u || !last.x)) || (b.y == spare && (offset == 0u || !last.y))) {
     return;
   }
+  let origin = first + b * 2 - vec2i(i32(offset));
 
   // 0 = top-left, 1 = top-right, 2 = bottom-left, 3 = bottom-right.
   // `var` (not `let`) so the arrays can be indexed with a loop variable everywhere.
   var p = array<vec2i, 4>(origin, origin + vec2i(1, 0), origin + vec2i(0, 1), origin + vec2i(1, 1));
   var c = array<u32, 4>(MAT_STONE, MAT_STONE, MAT_STONE, MAT_STONE);
+  var at = array<u32, 4>(CELL_NONE, CELL_NONE, CELL_NONE, CELL_NONE);
   // Cells in a shelter (a truck's bucket, shelter.wgsl) are out of the wind, with the rest of their block.
   var sheltered = false;
   for (var i = 0u; i < 4u; i++) {
-    if (inGrid(p[i], size)) {
-      c[i] = (*cells)[gridIndex(p[i], size)];
-      sheltered = sheltered || maskBit(shelter, p[i], size);
+    if (inWorld(p[i])) {
+      let page = pageAt(table, p[i]);
+      if (!pageLive(page)) {
+        return;
+      }
+      at[i] = slotCell(page, p[i]);
+      c[i] = (*cells)[at[i]];
+      sheltered = sheltered || maskBit(shelter, page, p[i]);
     }
   }
   var before = c;
 
-  let r = hashPcg(index ^ hashPcg(seed));
+  let r = hashPcg(worldCellId(origin) ^ hashPcg(seed));
   var t: u32;
 
   // 1. Fall straight down (gases rise: empty space sinks into them). Sinking through
@@ -72,8 +90,12 @@ fn stepBlock(
   }
 
   // 3. Wind (dynamic pressure) pushes cells into empty space or gas, more strongly for high-drag materials.
-  let a = airIndex((origin + 1) / i32(AIR_CELL), airSize);
-  let wind = vec2i(airWind((*air)[a + AIR_VX]), airWind((*air)[a + AIR_VY]));
+  // (The air cell of the bottom-right cell: past the world's edge there is none, and no wind.)
+  let a = airIndex(table, (origin + 1) / i32(AIR_CELL));
+  var wind = vec2i(0);
+  if (a != CELL_NONE) {
+    wind = vec2i(airWind((*air)[a + AIR_VX]), airWind((*air)[a + AIR_VY]));
+  }
   let speed = vec2u(abs(wind));
   if (speed.x != 0u && !sheltered) {
     let right = wind.x > 0;
@@ -110,8 +132,8 @@ fn stepBlock(
   }
 
   for (var i = 0u; i < 4u; i++) {
-    if (c[i] != before[i] && inGrid(p[i], size)) {
-      (*cells)[gridIndex(p[i], size)] = c[i];
+    if (c[i] != before[i] && at[i] != CELL_NONE) {
+      (*cells)[at[i]] = c[i];
     }
   }
 }

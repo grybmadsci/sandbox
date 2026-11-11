@@ -14,39 +14,50 @@
 // always drift, and step.wgsl turns them around at random so they spread out.
 // Neighbouring cells of the same liquid also hand on pressure credit (pressure.wgsl)
 // toward the side fewer hops from a sink.
+//
+// Runs over the live chunks (LIST_LIVE): PAIRS_ACROSS pairs on each of the chunk's rows of
+// this row phase. A pair belongs to the chunk holding the cell 2 * (its place in the row)
+// from the chunk's first column (its left cell in even passes, its right in odd ones); in
+// odd passes the pair hanging over the world's right edge belongs to the last chunks.
+
 fn flowPair(
   cells: ptr<storage, array<u32>, read_write>,
   field: ptr<storage, array<u32>, read_write>,
+  table: ptr<storage, array<u32>, read_write>,
   index: u32,
-  size: vec2u,
   offset: u32,
   rowPhase: u32,
   passIndex: u32,
 ) -> void {
-  let pairsPerRow = size.x / 2u + 1u;
-  let rows = (size.y + 2u) / 3u;
-  if (index >= pairsPerRow * rows) {
+  let n = index / (PAIRS_ACROSS * PHASE_ROWS);
+  if (n >= listCount(table, LIST_LIVE)) {
     return;
   }
-  let pa = vec2i(i32(index % pairsPerRow) * 2 - i32(offset), i32((index / pairsPerRow) * 3u + rowPhase));
+  let first = chunkOrigin(listEntry(table, LIST_LIVE, n));
+  let k = index % (PAIRS_ACROSS * PHASE_ROWS);
+  let pair = i32(k % PAIRS_ACROSS);
+  // The chunk's first row in this row phase (rows modulo 3 count from the top of the world).
+  let row = (rowPhase + 3u - u32(first.y) % 3u) % 3u + (k / PAIRS_ACROSS) * 3u;
+  if (row >= CHUNK_SIZE || (pair == i32(CHUNK_SIZE / 2u) && (offset == 0u || first.x + i32(CHUNK_SIZE) < i32(WORLD_SIZE)))) {
+    return;
+  }
+  let pa = first + vec2i(pair * 2 - i32(offset), i32(row));
   let pb = pa + vec2i(1, 0);
-  if (pa.x >= i32(size.x) || pa.y >= i32(size.y)) {
+  let ia = liveCell(table, pa);
+  let ib = liveCell(table, pb);
+  if ((inWorld(pa) && ia == CELL_NONE) || (inWorld(pb) && ib == CELL_NONE)) {
     return;
   }
 
-  // Outside the grid reads as stone.
+  // Outside the world, or a chunk with no slot, reads as stone.
   var a = MAT_STONE;
   var b = MAT_STONE;
-  var belowA = MAT_STONE;
-  var belowB = MAT_STONE;
-  var twoBelowA = MAT_STONE;
-  var twoBelowB = MAT_STONE;
-  if (inGrid(pa, size)) { a = (*cells)[gridIndex(pa, size)]; }
-  if (inGrid(pb, size)) { b = (*cells)[gridIndex(pb, size)]; }
-  if (inGrid(pa + vec2i(0, 1), size)) { belowA = (*cells)[gridIndex(pa + vec2i(0, 1), size)]; }
-  if (inGrid(pb + vec2i(0, 1), size)) { belowB = (*cells)[gridIndex(pb + vec2i(0, 1), size)]; }
-  if (inGrid(pa + vec2i(0, 2), size)) { twoBelowA = (*cells)[gridIndex(pa + vec2i(0, 2), size)]; }
-  if (inGrid(pb + vec2i(0, 2), size)) { twoBelowB = (*cells)[gridIndex(pb + vec2i(0, 2), size)]; }
+  if (ia != CELL_NONE) { a = (*cells)[ia]; }
+  if (ib != CELL_NONE) { b = (*cells)[ib]; }
+  let belowA = cellOrStone(cells, table, pa + vec2i(0, 1));
+  let belowB = cellOrStone(cells, table, pb + vec2i(0, 1));
+  let twoBelowA = cellOrStone(cells, table, pa + vec2i(0, 2));
+  let twoBelowB = cellOrStone(cells, table, pb + vec2i(0, 2));
 
   let flowsA = passIndex < MATERIAL_SPREAD[cellMaterial(a)] && flowsSideways(a, belowA, twoBelowA);
   let flowsB = passIndex < MATERIAL_SPREAD[cellMaterial(b)] && flowsSideways(b, belowB, twoBelowB);
@@ -64,8 +75,8 @@ fn flowPair(
     if (wantsLeft) { newB = flipDirection(b); }
     if (cellKind(a) == KIND_LIQUID && cellMaterial(a) == cellMaterial(b)
       && cellCredit(a) + cellCredit(b) <= CREDIT_MAX) {
-      let da = fieldDistance((*field)[gridIndex(pa, size)]);
-      let db = fieldDistance((*field)[gridIndex(pb, size)]);
+      let da = fieldDistance((*field)[ia]);
+      let db = fieldDistance((*field)[ib]);
       if (cellCredit(newA) != 0u && db < da) {
         newB = withCredit(newB, cellCredit(newB) + cellCredit(newA));
         newA = withCredit(newA, 0u);
@@ -76,6 +87,6 @@ fn flowPair(
     }
   }
 
-  if (newA != a && inGrid(pa, size)) { (*cells)[gridIndex(pa, size)] = newA; }
-  if (newB != b && inGrid(pb, size)) { (*cells)[gridIndex(pb, size)] = newB; }
+  if (newA != a && ia != CELL_NONE) { (*cells)[ia] = newA; }
+  if (newB != b && ib != CELL_NONE) { (*cells)[ib] = newB; }
 }

@@ -13,3 +13,9 @@ body,
   font-family: system-ui, sans-serif;
   color: #fff;
 }
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}

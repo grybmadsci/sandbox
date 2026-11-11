@@ -38,7 +38,10 @@ export default function App() {
           camera={{ position: [0, 0, 100], zoom: 1, near: 0.1, far: 1000 }}
           onContextMenu={(e) => e.preventDefault()}
           gl={async (props) => {
-            const renderer = new THREE.WebGPURenderer(props as THREE.WebGPURendererParameters)
+            // The kernels bind up to 8 storage buffers each (the default limit); take more if the GPU has them.
+            const adapter = await navigator.gpu.requestAdapter()
+            const requiredLimits = adapter ? { maxStorageBuffersPerShaderStage: adapter.limits.maxStorageBuffersPerShaderStage } : undefined
+            const renderer = new THREE.WebGPURenderer({ ...(props as THREE.WebGPURendererParameters), requiredLimits })
             await renderer.init()
             return renderer
           }}

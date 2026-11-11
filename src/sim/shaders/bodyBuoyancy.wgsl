@@ -6,18 +6,22 @@
 // under it) too, and it only follows the liquid actually beside each row, so a few
 // drops beside a body barely lift it and a gap the liquid hasn't filled yet doesn't.
 // Also counts the body's cells, and how many are submerged (for the liquid's drag,
-// bodies.ts). One invocation per cell.
+// bodies.ts). One invocation per cell of the chunks bodies are near (LIST_BODIES).
 fn bodyBuoyancy(
   cells: ptr<storage, array<u32>, read_write>,
   bodies: ptr<storage, array<f32>, read_write>,
   forces: ptr<storage, array<atomic<i32>>, read_write>,
+  table: ptr<storage, array<u32>, read_write>,
   index: u32,
-  size: vec2u,
 ) -> void {
-  if (index >= size.x * size.y) {
+  let n = index / CHUNK_CELLS;
+  if (n >= listCount(table, LIST_BODIES)) {
     return;
   }
-  let cell = (*cells)[index];
+  let chunk = listEntry(table, LIST_BODIES, n);
+  let k = index % CHUNK_CELLS;
+  let p = chunkOrigin(chunk) + vec2i(i32(k % CHUNK_SIZE), i32(k / CHUNK_SIZE));
+  let cell = (*cells)[slotCell((*table)[chunk], p)];
   if (cellMaterial(cell) != MAT_BODY) {
     return;
   }
@@ -28,21 +32,18 @@ fn bodyBuoyancy(
   let out = slot * BODY_FORCE_INTS;
   atomicAdd(&(*forces)[out + BODY_CELLS], 1);
 
-  // What lies just past the body along this row, on each side (outside the grid is
-  // stone), and how far away.
-  let p = vec2i(i32(index % size.x), i32(index / size.x));
+  // What lies just past the body along this row, on each side (outside the world, or in a
+  // chunk with no slot, is stone), and how far away.
   var past = array<u32, 2>(MAT_STONE, MAT_STONE);
   var reach = array<i32, 2>(0, 0);
   for (var i = 0; i < 2; i++) {
     let side = i * 2 - 1;
     var x = p.x + side;
-    while (x >= 0 && x < i32(size.x) && (*cells)[gridIndex(vec2i(x, p.y), size)] == cell) {
+    while (cellOrStone(cells, table, vec2i(x, p.y)) == cell) {
       x += side;
     }
     reach[i] = abs(x - p.x);
-    if (x >= 0 && x < i32(size.x)) {
-      past[i] = (*cells)[gridIndex(vec2i(x, p.y), size)];
-    }
+    past[i] = cellOrStone(cells, table, vec2i(x, p.y));
   }
   // The nearer side decides, so where a tilted body's row crosses the surface only its
   // lower end is under; the other side if the nearer one is a wall.

@@ -22,6 +22,14 @@
 //
 // Net effect: connected vessels level out, and liquid volume (cells + credit) is
 // conserved exactly. A stale field only stalls the transfer, it can't create liquid.
+//
+// Cells in chunks that aren't live are skipped and left unwritten, in both directions of
+// the ping-pong (so their field stays as it was), and read as walls by the cells beside them.
+// Runs over the live chunks (LIST_LIVE), an invocation per column of each, walking down it
+// from the chunk's top where pressureSplit.wgsl says the walk can start afresh there (else
+// the walk from above carries on into it), on past chunks the walk carries on into, until
+// it reaches one that isn't live or where a walk starts afresh. Heads count from the top
+// row of each cell's chunk (see HEAD_BASE): a run works in its top cell's, and converts.
 fn pressureColumn(
   cells: ptr<storage, array<u32>, read_write>,
   air: ptr<storage, array<i32>, read_write>,
@@ -30,32 +38,48 @@ fn pressureColumn(
   fieldOut: ptr<storage, array<u32>, read_write>,
   hopsIn: ptr<storage, array<u32>, read_write>,
   hopsOut: ptr<storage, array<u32>, read_write>,
+  splits: ptr<storage, array<u32>, read_write>,
+  table: ptr<storage, array<u32>, read_write>,
   index: u32,
-  size: vec2u,
-  airSize: vec2u,
 ) -> void {
   const PUSH_ROWS = 4u;
   // A donor stops giving once its run holds this much credit (limits liquid in transit).
   const CREDIT_CAP = 4u;
   // Most credit a cell holds while it waits at a sink, unless there is more to share.
   const CREDIT_SPREAD = 8u;
-  if (index >= size.x) {
+  if (index / CHUNK_SIZE >= listCount(table, LIST_LIVE)) {
     return;
   }
-  let w = size.x;
-  let h = i32(size.y);
-  let hasLeft = index > 0u;
-  let hasRight = index + 1u < w;
+  let column = index % CHUNK_SIZE;
+  let start = chunkOrigin(listEntry(table, LIST_LIVE, index / CHUNK_SIZE)) + vec2i(i32(column), 0);
+  if ((*splits)[pageSlot(pageAt(table, start)) * CHUNK_SIZE + column] == 0u) {
+    return;
+  }
+  let x = start.x;
+  let h = i32(WORLD_SIZE);
+  // The chunk row the walk is in, and where it is in the buffers (liveBases).
+  var row = start.y / i32(CHUNK_SIZE);
+  var bases = liveBases(table, x, start.y);
 
-  var y = 0;
+  var y = start.y;
   loop {
     if (y >= h) {
       break;
     }
-    let first = (*cells)[u32(y) * w + index];
+    if (y / i32(CHUNK_SIZE) != row) {
+      row = y / i32(CHUNK_SIZE);
+      bases = liveBases(table, x, y);
+    }
+    // At the top of a chunk below (not reached in the middle of a run): if it isn't live,
+    // or a walk starts afresh there, this walk is done.
+    if (y % i32(CHUNK_SIZE) == 0 && y != start.y && (bases.y == CELL_NONE || (*splits)[bases.y / CHUNK_CELLS * CHUNK_SIZE + column] != 0u)) {
+      break;
+    }
+    let i = liveAt(bases.y, y);
+    let first = (*cells)[i];
     if (cellKind(first) != KIND_LIQUID) {
       // Written blind: in this serial walk a write is far cheaper than a read to check it.
-      (*fieldOut)[u32(y) * w + index] = FIELD_NONE;
+      (*fieldOut)[i] = FIELD_NONE;
       y++;
       continue;
     }
@@ -63,12 +87,14 @@ fn pressureColumn(
     // Scan the run: gather credit, the best head, and the exit toward the nearest sink.
     let m = cellMaterial(first);
     let top = y;
+    let topChunk = top / i32(CHUNK_SIZE);
     var above = MAT_EMPTY;  // the top of the world is open
+    let aboveAt = liveCell(table, vec2i(x, top - 1));
     if (top > 0) {
-      above = (*cells)[u32(top - 1) * w + index];
+      above = select(MAT_STONE, (*cells)[min(aboveAt, i)], aboveAt != CELL_NONE);
     }
     let openAbove = cellKind(above) == KIND_EMPTY || cellKind(above) == KIND_GAS;
-    // The free surface's level (offset by HEAD_BASE rows), raised by the gauge pressure
+    // The free surface's level (from its chunk's top row, offset by HEAD_BASE rows), raised by the gauge pressure
     // of the air on it: the time-averaged gauge (air.wgsl) pooled over nearby cells (3
     // across, in the surface's air row and the one above), weighted by open volume, so
     // single noisy air cells don't push the liquid around. Partly filled cells (like
@@ -78,18 +104,18 @@ fn pressureColumn(
     // liquid, a thin gap under stone) isn't treated as a free surface at all: air cells
     // that are mostly filled give erratic pressures, and the liquid mustn't be pushed
     // into a gap whose air it can't feel. The run takes its head from its neighbours.
-    var surface = (top + i32(HEAD_BASE)) * i32(HEAD_ONE);
+    var surface = (top - topChunk * i32(CHUNK_SIZE) + i32(HEAD_BASE)) * i32(HEAD_ONE);
     var airHead = 0;  // the air's push, in 1/HEAD_ONE rows
     var free = false;
     if (openAbove) {
-      let around = vec2i(i32(index), top - 1) / i32(AIR_CELL);
+      let around = vec2i(x, top - 1) / i32(AIR_CELL);
       // (gauge * volume, volume): fully open cells, all open cells.
       var pools = array<vec2i, 2>(vec2i(0), vec2i(0));
       for (var dy = -1; dy <= 0; dy++) {
         for (var dx = -1; dx <= 1; dx++) {
           let q = around + vec2i(dx, dy);
-          if (q.x >= 0 && q.y >= 0 && q.x < i32(airSize.x)) {
-            let a = airIndex(q, airSize);
+          let a = airIndex(table, q);
+          if (a != CELL_NONE) {
             let volume = airVolume((*air)[a + AIR_VOLUME]);
             if (volume > 0) {
               // In 1/HEAD_ONE rows, so the volume-weighted sum fits in an i32.
@@ -123,21 +149,30 @@ fn pressureColumn(
       if (y >= h) {
         break;
       }
-      let j = u32(y) * w + index;
+      if (y / i32(CHUNK_SIZE) != row) {
+        row = y / i32(CHUNK_SIZE);
+        bases = liveBases(table, x, y);
+      }
+      let j = liveAt(bases.y, y);
+      if (j == CELL_NONE) {
+        break;
+      }
       let cell = (*cells)[j];
       if (cellMaterial(cell) != m) {
         break;
       }
       credit += cellCredit(cell);
+      // Neighbours' heads count from their chunk's top: from the run's, they're this many chunks down.
+      let down = u32(y / i32(CHUNK_SIZE) - topChunk);
       for (var side = 0u; side < 2u; side++) {
-        if ((side == 0u && hasLeft) || (side == 1u && hasRight)) {
-          let k = select(j + 1u, j - 1u, side == 0u);
+        let k = liveAt(select(bases.z, bases.x, side == 0u), y);
+        if (k != CELL_NONE) {
           let f = (*fieldIn)[k];
           // The side a neighbour's value names if it came from us, and the side it is on.
           let fromUs = select(FROM_LEFT, FROM_RIGHT, side == 0u);
           let fromThem = select(FROM_RIGHT, FROM_LEFT, side == 0u);
           if (f != FIELD_NONE) {
-            let h2 = min(fieldHead(f) + 1u, HEAD_INF);
+            let h2 = select(min(fieldHead(f) + down * HEAD_CHUNK + 1u, HEAD_INF), HEAD_INF, fieldHead(f) >= HEAD_INF);
             if (fieldHeadFrom(f) != fromUs && h2 < head) {
               head = h2;
               headFrom = fromThem;
@@ -162,21 +197,23 @@ fn pressureColumn(
     // is never routed into it, and flow.wgsl hands any credit it has back to resting
     // neighbours. Credit it still holds (it spilled over an edge with some) comes out
     // below it as falling water, one cell per pass, rather than piling up above it.
-    var under = MAT_STONE;  // below the world counts as stone
-    if (y < h) {
-      under = (*cells)[u32(y) * w + index];
+    var under = MAT_STONE;  // below the world, or a chunk that isn't live, counts as stone
+    let underAt = liveCell(table, vec2i(x, y));
+    let bottomAt = liveCell(table, vec2i(x, bottom));
+    if (underAt != CELL_NONE) {
+      under = (*cells)[underAt];
     }
-    if (sinksInto((*cells)[u32(bottom) * w + index], under)) {
+    if (sinksInto((*cells)[bottomAt], under)) {
       if (credit > 0u && cellMaterial(under) == MAT_EMPTY) {
-        (*cells)[u32(y) * w + index] = withCredit(flipDirection(first), 0u);
-        (*fieldOut)[u32(y) * w + index] = FIELD_NONE;
+        (*cells)[underAt] = withCredit(flipDirection(first), 0u);
+        (*fieldOut)[underAt] = FIELD_NONE;
         credit -= 1u;
         y++;  // the new cell joins this run next pass, not this one
       }
       let held = min(credit, CREDIT_MAX);
       var excess = credit - held;
       for (var yy = top; yy <= bottom; yy++) {
-        let j = u32(yy) * w + index;
+        let j = liveCell(table, vec2i(x, yy));
         let cell = (*cells)[j];
         var share = held;
         if (yy != bottom) {
@@ -215,13 +252,13 @@ fn pressureColumn(
     var newTop = top;
     if (credit > 0u && canGrow && (sink || distance == DIST_INF)) {
       // Grow a cell from credit: pushed up at a sink, or handed back when no sink is left.
-      (*cells)[u32(top - 1) * w + index] = withCredit(flipDirection(first), 0u);
+      (*cells)[aboveAt] = withCredit(flipDirection(first), 0u);
       credit -= 1u;
       newTop = top - 1;
     } else if (donor && distance != DIST_INF && credit < CREDIT_CAP && bottom > top) {
       // The highest surface gives up its top cell toward the sink.
-      (*cells)[u32(top) * w + index] = MAT_EMPTY;
-      (*fieldOut)[u32(top) * w + index] = FIELD_NONE;
+      (*cells)[i] = MAT_EMPTY;
+      (*fieldOut)[i] = FIELD_NONE;
       credit += 1u;
       newTop = top + 1;
     }
@@ -237,9 +274,8 @@ fn pressureColumn(
     let perCell = select(CREDIT_MAX, max(CREDIT_SPREAD, (credit + runCells - 1u) / runCells), waiting);
     let held = min(credit, min(perCell, CREDIT_MAX));
     var excess = credit - held;
-    let f = makeField(head, headFrom, distance, distanceFrom);
     for (var yy = newTop; yy <= bottom; yy++) {
-      let j = u32(yy) * w + index;
+      let j = liveCell(table, vec2i(x, yy));
       let cell = (*cells)[j];
       var share = held;
       if (yy != holder) {
@@ -250,7 +286,7 @@ fn pressureColumn(
       if (wanted != cell) {
         (*cells)[j] = wanted;
       }
-      (*fieldOut)[j] = f;
+      (*fieldOut)[j] = makeField(headBelow(head, u32(yy / i32(CHUNK_SIZE) - topChunk)), headFrom, distance, distanceFrom);
       (*hopsOut)[j] = packHops(headHops, headAir);
     }
   }

@@ -220,8 +220,20 @@ export type JointSpec = {
 /** Bodies joined together, added and removed as one (a vehicle, say). */
 export type Assembly = { parts: BodySpec[]; joints: JointSpec[] }
 
-/** The bodies of an assembly in the world (by slot), and its motorised joints. */
-type Group = { slots: number[]; motors: { joint: RAPIER.UnitImpulseJoint; motor: JointMotor }[] }
+/**
+ * A joint as made: where it is on each part (in the part's own frame), and for fixed
+ * joints the angle between the parts it holds; otherwise as JointSpec.
+ */
+export type JointLink = Omit<JointSpec, 'at'> & { anchorA: [number, number]; anchorB: [number, number]; frame: number }
+
+/** A body as saved: its spec, posed where it is, and how it is moving. */
+export type SavedBody = BodySpec & { vx: number; vy: number; spin: number }
+
+/** A body, or an assembly of them (parts by index, as in JointLink), as saved: in a save file, or put away while out of the simulated window. */
+export type SavedGroup = { parts: SavedBody[]; joints: JointLink[] }
+
+/** The bodies of an assembly in the world (by slot), how they're joined, and its motorised joints. */
+type Group = { slots: number[]; links: JointLink[]; motors: { joint: RAPIER.UnitImpulseJoint; motor: JointMotor }[] }
 
 /** Wheel motors: target spin (radians per second; wheels roll toward +x when positive) and how hard they hold it. */
 const DRIVE_SPIN = 12
@@ -232,6 +244,8 @@ const TIP_DAMPING = 120
 
 /** Most cells a body carries what rests on it in one step (carry.wgsl's CARRY_MAX). */
 const CARRY_MAX = 3
+/** How far up a pile resting on a body is weighed, and carried with it (common.wgsl). */
+export const BODY_MAX_LOAD = 128
 
 /** How much of each step's measured ground pressure goes into a body's smoothed pressure. */
 const PRESSURE_SMOOTHING = 0.2
@@ -262,8 +276,10 @@ type Slot = {
 }
 
 /**
- * Rigid bodies, simulated by Rapier in grid units (cells, y down) and coupled to the
- * sand grid both ways:
+ * Rigid bodies, simulated by Rapier in world cells (y down) and coupled to the sand grid
+ * both ways. Only some of the world's chunks are on the GPU (SandSim): bodies reaching
+ * the rest are put away (`evictWhere`) until they're back (`restore`, ChunkManager).
+ *
  * - SandSim stamps them into the grid every step (stamp.wgsl) from `pack`, so sand,
  *   liquids and air treat them as solid (and particles in their way are pushed aside);
  * - a voxel collider mirrors the ground they collide with (stone and settled powder,
@@ -282,25 +298,31 @@ export class BodyWorld {
   private readonly carryData = new Int32Array(MAX_BODIES * 2)
   private readonly pressureData = new Float32Array(MAX_BODIES)
   private readonly shelterData = new Float32Array(MAX_BODIES * SHELTER_FLOATS)
-  /** The ground bits the voxel collider holds (as last applied). */
-  private ground: Uint32Array
-  /** Columns that bodies removed since the last pack covered, so the stamp clears them. */
+  /** The ground bits the voxel collider holds (as last applied), over the whole world, column-major: chunks' ground is copied in as it's measured. */
+  private readonly ground: Uint32Array
+  /** Columns (world) that bodies removed since the last pack covered, so the stamp clears them. */
   private cleared: [number, number] | null = null
+  /** Where bodies whose stamp moved were (world cells: min x, min y, max x, max y), since `takeMoved`. */
+  private moved: number[][] = []
 
   readonly width: number
   readonly height: number
   private readonly wordsPerColumn: number
 
-  constructor(width: number, height: number, wordsPerColumn: number, stepsPerSecond: number) {
+  constructor(width: number, height: number, stepsPerSecond: number) {
     this.width = width
     this.height = height
-    this.wordsPerColumn = wordsPerColumn
+    this.wordsPerColumn = Math.ceil(height / 32)
     this.world = new RAPIER.World({ x: 0, y: GRAVITY })
     this.world.timestep = 1 / stepsPerSecond
     // Rapier's tolerances are tuned for metres; bodies here are tens of cells across.
     this.world.lengthUnit = 10
     this.terrain = this.world.createCollider(RAPIER.ColliderDesc.voxels(new Int32Array(0), { x: 1, y: 1 }))
-    this.ground = new Uint32Array(width * wordsPerColumn)
+    // Rapier (0.19) panics a few steps into a world this big with a voxel collider holding
+    // no voxels at all (before any ground is measured, or once all of it is cleared): keep
+    // one, out of the way inside the wall past the world's corner.
+    this.terrain.setVoxel(-8, -8, true)
+    this.ground = new Uint32Array(width * this.wordsPerColumn)
 
     // Outside the grid counts as stone.
     const wall = (x: number, y: number, hw: number, hh: number) =>
@@ -327,26 +349,115 @@ export class BodyWorld {
    * when there aren't enough free slots.
    */
   addAssembly({ parts, joints }: Assembly) {
+    const links = joints.map(({ at, ...joint }): JointLink => {
+      const [pa, pb] = [parts[joint.a], parts[joint.b]]
+      const a = toLocal(pa, at)
+      const b = toLocal(pb, at)
+      return { ...joint, anchorA: [a.x, a.y], anchorB: [b.x, b.y], frame: pb.angle - pa.angle }
+    })
+    return this.restore({ parts: parts.map((spec) => ({ ...spec, vx: 0, vy: 0, spin: 0 })), joints: links })
+  }
+
+  /** Bring back bodies as saved (`serialize`, `evictOutside`); false, adding nothing, when there aren't enough free slots. */
+  restore({ parts, joints }: SavedGroup) {
     const free = this.slots.flatMap((slot, i) => (slot ? [] : [i]))
     if (free.length < parts.length) return false
-    const group: Group = { slots: free.slice(0, parts.length), motors: [] }
-    const bodies = parts.map((spec, k) => this.create(group.slots[k], spec, group))
-    for (const { a, b, kind, at, limits, motor } of joints) {
-      const [pa, pb] = [parts[a], parts[b]]
-      const anchorA = toLocal(pa, at)
-      const anchorB = toLocal(pb, at)
+    const group: Group | null = parts.length > 1 || joints.length > 0 ? { slots: free.slice(0, parts.length), links: joints, motors: [] } : null
+    const bodies = parts.map(({ vx, vy, spin, ...spec }, k) => {
+      const body = this.create(free[k], spec, group)
+      body.setLinvel({ x: vx, y: vy }, true)
+      body.setAngvel(spin, true)
+      return body
+    })
+    for (const { a, b, kind, anchorA, anchorB, frame, limits, motor } of joints) {
+      const [ax, ay] = anchorA
+      const [bx, by] = anchorB
       const data =
         kind === 'fixed'
-          ? RAPIER.JointData.fixed(anchorA, pb.angle - pa.angle, anchorB, 0)
-          : RAPIER.JointData.revolute(anchorA, anchorB)
+          ? RAPIER.JointData.fixed({ x: ax, y: ay }, frame, { x: bx, y: by }, 0)
+          : RAPIER.JointData.revolute({ x: ax, y: ay }, { x: bx, y: by })
       const joint = this.world.createImpulseJoint(data, bodies[a], bodies[b], true)
       joint.setContactsEnabled(false)
       // (Limits set on the JointData aren't applied to revolute joints.)
       if (limits) (joint as RAPIER.UnitImpulseJoint).setLimits(...limits)
-      if (motor) group.motors.push({ joint: joint as RAPIER.UnitImpulseJoint, motor })
+      if (motor) group!.motors.push({ joint: joint as RAPIER.UnitImpulseJoint, motor })
     }
     this.control(0, false)
     return true
+  }
+
+  /** The slots of a body's group: the whole assembly, or just it. */
+  private groupOf(i: number) {
+    return this.slots[i]?.group?.slots ?? [i]
+  }
+
+  private save(slots: number[]): SavedGroup {
+    const parts = slots.map((i): SavedBody => {
+      const { body, spec } = this.slots[i]!
+      const { x, y } = body.translation()
+      const v = body.linvel()
+      return { ...spec, x, y, angle: body.rotation(), vx: v.x, vy: v.y, spin: body.angvel() }
+    })
+    return { parts, joints: this.slots[slots[0]]!.group?.links ?? [] }
+  }
+
+  /** Every body, as it is now, by group. */
+  serialize(): SavedGroup[] {
+    const done = new Set<number>()
+    const out: SavedGroup[] = []
+    this.slots.forEach((slot, i) => {
+      if (!slot || done.has(i)) return
+      const slots = this.groupOf(i)
+      for (const j of slots) done.add(j)
+      out.push(this.save(slots))
+    })
+    return out
+  }
+
+  /**
+   * Take out, and return as saved, every group with any part where `fits` (given the world
+   * cells a part may reach: min x, min y, max x, max y) says it can't stay.
+   */
+  evictWhere(fits: (x0: number, y0: number, x1: number, y1: number) => boolean): SavedGroup[] {
+    const out: SavedGroup[] = []
+    this.slots.forEach((slot, i) => {
+      if (!slot) return
+      const { x, y } = slot.body.translation()
+      if (fits(x - slot.reach, y - slot.reach, x + slot.reach, y + slot.reach)) return
+      const slots = this.groupOf(i)
+      out.push(this.save(slots))
+      for (const j of slots) if (this.slots[j]) this.remove(j)
+    })
+    return out
+  }
+
+  /** Where each body may reach now (world cells: min x, min y, max x, max y). */
+  extents() {
+    return this.slots.flatMap((slot) => {
+      if (!slot) return []
+      const { x, y } = slot.body.translation()
+      return [[x - slot.reach, y - slot.reach, x + slot.reach, y + slot.reach]]
+    })
+  }
+
+  /** How far a saved group reaches (world cells: min x, min y, max x, max y). */
+  static bounds({ parts }: SavedGroup) {
+    let [x0, y0, x1, y1] = [Infinity, Infinity, -Infinity, -Infinity]
+    for (const { x, y, shape } of parts) {
+      const reach = Math.max(...shape.points.map(([px, py]) => Math.hypot(px, py))) + shape.radius
+      x0 = Math.min(x0, x - reach)
+      y0 = Math.min(y0, y - reach)
+      x1 = Math.max(x1, x + reach)
+      y1 = Math.max(y1, y + reach)
+    }
+    return [x0, y0, x1, y1]
+  }
+
+  /** Where bodies whose stamp has moved have been since the last call (world cells: min x, min y, max x, max y each). */
+  takeMoved() {
+    const moved = this.moved
+    this.moved = []
+    return moved
   }
 
   /**
@@ -392,7 +503,7 @@ export class BodyWorld {
     return body
   }
 
-  /** Remove every body within `radius` of a grid point, with the rest of its assembly. */
+  /** Remove every body within `radius` of a world point (cells), with the rest of its assembly. */
   removeNear(x: number, y: number, radius: number) {
     const probe = new RAPIER.Ball(radius + STAMP_MARGIN)
     this.slots.forEach((slot, i) => {
@@ -490,8 +601,8 @@ export class BodyWorld {
   }
 
   /**
-   * The bodies as the GPU reads them (see common.wgsl), and the columns the stamp must
-   * rewrite. A body is packed where it was last stamped until its outline has moved by
+   * The bodies as the GPU reads them (see common.wgsl), and the columns of the world the
+   * stamp must rewrite. A body is packed where it was last stamped until its outline has moved by
    * STAMP_SLACK, so the stamp of a body at rest doesn't change; and only the columns of
    * bodies whose stamp changes (where they are and were), or that press hard enough to
    * push powder aside, or that were removed, are rewritten. Null when there are no
@@ -512,7 +623,9 @@ export class BodyWorld {
       const was = slot.stamped
       const moved = !was || Math.hypot(x - was.x, y - was.y) > STAMP_SLACK || Math.abs(angle - was.angle) * slot.reach > STAMP_SLACK
       if (moved) slot.stamped = { x, y, angle }
-      const [x0, , x1] = packBody({ ...slot.spec, ...slot.stamped! }, data, i * BODY_FLOATS)
+      const stamped = slot.stamped!
+      const [x0, y0, x1, y1] = packBody({ ...slot.spec, ...stamped }, data, i * BODY_FLOATS)
+      if (moved) this.moved.push([x0, y0, x1, y1])
       this.pressureData[i] = slot.pressure
       if (moved || slot.pressure > minBearing) {
         from = Math.min(from, x0, slot.columns?.[0] ?? Infinity)
@@ -521,21 +634,25 @@ export class BodyWorld {
       slot.columns = [x0, x1]
     })
     if (!any) return null
+    from = Math.max(0, Math.floor(from))
+    to = Math.min(this.width, Math.ceil(to) + 1)
     if (to < from) return { data, pressures: this.pressureData, from: 0, to: 0 }
-    return { data, pressures: this.pressureData, from: Math.max(0, Math.floor(from)), to: Math.min(this.width, Math.ceil(to) + 1) }
+    return { data, pressures: this.pressureData, from, to }
   }
 
   /**
    * The bodies that have crossed cell boundaries sideways since their riders were last
-   * carried, as carry.wgsl reads them (slot, shift in cells), and the columns to look at:
-   * around where they were last packed (where the grid still has them). Call after
-   * stepping, before packing.
+   * carried, as carry.wgsl reads them (slot, shift in cells), and the columns and rows to
+   * look at: around where they were last packed (where the grid still has them), and the
+   * piles on them. Call after stepping, before packing.
    */
-  carries(): { data: Int32Array; count: number; from: number; to: number } {
+  carries(): { data: Int32Array; count: number; from: number; to: number; top: number; bottom: number } {
     const data = this.carryData
     let count = 0
     let from = Infinity
     let to = -Infinity
+    let top = Infinity
+    let bottom = -Infinity
     this.slots.forEach((slot, i) => {
       if (!slot || slot.spec.fixed) return
       const x = Math.round(slot.body.translation().x)
@@ -548,9 +665,18 @@ export class BodyWorld {
       const o = i * BODY_FLOATS
       from = Math.min(from, this.data[o + 6])
       to = Math.max(to, this.data[o + 8])
+      top = Math.min(top, this.data[o + 7])
+      bottom = Math.max(bottom, this.data[o + 9])
     })
     const reach = CARRY_MAX + 2
-    return { data, count, from: Math.max(0, Math.floor(from) - reach), to: Math.min(this.width, Math.ceil(to) + reach) }
+    return {
+      data,
+      count,
+      from: Math.max(0, Math.floor(from) - reach),
+      to: Math.min(this.width, Math.ceil(to) + reach),
+      top: Math.max(0, Math.floor(top) - BODY_MAX_LOAD - 1),
+      bottom: Math.min(this.height, Math.ceil(bottom) + 1),
+    }
   }
 
   /** The bodies' shelters as shelter.wgsl reads them (SHELTER_FLOATS each), where the bodies are now. */
@@ -575,12 +701,15 @@ export class BodyWorld {
 
   /**
    * The lasers (objects.ts), LASER_FLOATS each as laser.wgsl reads them: where the beam
-   * starts, its direction, its body's slot (so it passes through its own cells) and range.
+   * starts, its direction, its body's slot (so it passes through its own
+   * cells) and range. Also each beam's full reach in the world (start x, y, end x, y), to
+   * keep the chunks it crosses live.
    */
-  packLasers(): { data: Float32Array; count: number } {
+  packLasers(): { data: Float32Array; count: number; beams: number[][] } {
     const data = this.laserData
     data.fill(0)
     let count = 0
+    const beams: number[][] = []
     this.slots.forEach((slot, i) => {
       if (slot?.spec.device?.kind !== 'laser' || count >= MAX_LASERS) return
       const { x, y } = slot.body.translation()
@@ -588,9 +717,11 @@ export class BodyWorld {
       const c = Math.cos(angle)
       const s = Math.sin(angle)
       const reach = slot.spec.device.reach
-      data.set([x + c * reach, y + s * reach, c, s, i, LASER_RANGE], count++ * LASER_FLOATS)
+      const [tx, ty] = [x + c * reach, y + s * reach]
+      data.set([tx, ty, c, s, i, LASER_RANGE], count++ * LASER_FLOATS)
+      beams.push([tx, ty, tx + c * LASER_RANGE, ty + s * LASER_RANGE])
     })
-    return { data, count }
+    return { data, count, beams }
   }
 
   /** Which body is in each slot, to match a force readback to the bodies it was measured on. */
@@ -623,22 +754,34 @@ export class BodyWorld {
     })
   }
 
-  /** Bring the voxel collider in step with the ground bits read back from the GPU (see solidMask.wgsl). */
-  applyGround(bits: Uint32Array) {
+  /**
+   * Bring the voxel collider in step with the ground bits read back from the GPU (see
+   * solidMask.wgsl): for each of `chunks` (chunk positions, in cells), `size` columns of
+   * `size / 32` words, skipping those not `valid` (their chunk has gone since). The voxels
+   * of the rest of the world stay as they were last seen (no bodies are there).
+   */
+  applyGround(bits: Uint32Array, chunks: [number, number][], size: number, valid: boolean[]) {
     if (this.disposed) return
-    const words = this.wordsPerColumn
-    for (let i = 0; i < bits.length; i++) {
-      let changed = bits[i] ^ this.ground[i]
-      if (changed === 0) continue
-      const x = Math.floor(i / words)
-      const y0 = (i % words) * 32
-      while (changed !== 0) {
-        const b = 31 - Math.clz32(changed)
-        changed &= ~(1 << b)
-        if (y0 + b < this.height) this.terrain.setVoxel(x, y0 + b, ((bits[i] >>> b) & 1) === 1)
+    const words = size / 32
+    chunks.forEach(([cx, cy], n) => {
+      if (!valid[n]) return
+      for (let column = 0; column < size; column++) {
+        const x = cx + column
+        for (let w = 0; w < words; w++) {
+          const i = (n * size + column) * words + w
+          const k = x * this.wordsPerColumn + cy / 32 + w
+          let changed = bits[i] ^ this.ground[k]
+          if (changed === 0) continue
+          const y0 = cy + w * 32
+          while (changed !== 0) {
+            const b = 31 - Math.clz32(changed)
+            changed &= ~(1 << b)
+            this.terrain.setVoxel(x, y0 + b, ((bits[i] >>> b) & 1) === 1)
+          }
+          this.ground[k] = bits[i]
+        }
       }
-    }
-    this.ground = bits
+    })
   }
 
   /** Readbacks still in flight are dropped once disposed: the WASM objects are gone. */
@@ -650,14 +793,20 @@ export class BodyWorld {
   }
 }
 
-/** Bodies in the starting level (see level.wgsl): a crate dropped into a pool, more on the dunes, a steel ramp with a ball on it, and another ball. */
-export function levelBodies(): BodySpec[] {
+/**
+ * Bodies the world starts with, around the landmarks at the spawn point (worldgen.ts,
+ * the ground level there in rows from the top): crates dropped onto the ground, a steel
+ * ramp with a ball on it, and another ball.
+ */
+export function levelBodies(spawnX: number, groundY: number): BodySpec[] {
+  const dx = spawnX - 1270
+  const dy = groundY - 410
   return [
-    boxBody(940, 362, 976, 378, 'wood', false),
-    boxBody(1250, 230, 1272, 252, 'wood', false),
-    boxBody(1320, 240, 1364, 250, 'wood', false),
-    beamBody(900, 196, 1060, 250, 6, 'steel', true),
-    ballBody(915, 175, 9, 'rubber', false),
-    ballBody(1640, 150, 7, 'rubber', false),
+    boxBody(940 + dx, 362 + dy, 976 + dx, 378 + dy, 'wood', false),
+    boxBody(1250 + dx, 230 + dy, 1272 + dx, 252 + dy, 'wood', false),
+    boxBody(1320 + dx, 240 + dy, 1364 + dx, 250 + dy, 'wood', false),
+    beamBody(900 + dx, 196 + dy, 1060 + dx, 250 + dy, 6, 'steel', true),
+    ballBody(915 + dx, 175 + dy, 9, 'rubber', false),
+    ballBody(1640 + dx, 150 + dy, 7, 'rubber', false),
   ]
 }

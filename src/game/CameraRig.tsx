@@ -6,23 +6,26 @@ const MIN_ZOOM = 0.5
 const MAX_ZOOM = 40
 const PAN_SPEED = 700 // screen pixels per second, so panning feels the same at any zoom
 const KEY_ZOOM_RATE = 2 // zoom multiplier per second
+const START_ZOOM = 2
 
-type Props = { worldWidth: number; worldHeight: number }
+/** The world's size, and where the camera starts (world units, y up). */
+type Props = { worldWidth: number; worldHeight: number; startX: number; startY: number }
 
 /**
  * Orthographic side-scroller camera. Zoom is screen pixels per cell.
  * Pan: WASD / arrows, or drag with right/middle mouse. Zoom: wheel (toward cursor), or Q / E.
+ * The edges of the screen never go past the edges of the world.
  */
-export function CameraRig({ worldWidth, worldHeight }: Props) {
+export function CameraRig({ worldWidth, worldHeight, startX, startY }: Props) {
   const camera = useThree((s) => s.camera)
   const gl = useThree((s) => s.gl)
-  const viewportHeight = useThree((s) => s.size.height)
+  // Zoomed out no further than the world fills the screen (pixels across over cells across).
+  const clampZoom = (zoom: number, width: number, height: number) =>
+    Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, width / worldWidth, height / worldHeight, zoom))
 
-  // Start framing the full world height, at the left edge of the level.
   useEffect(() => {
-    const zoom = Math.max(MIN_ZOOM, viewportHeight / worldHeight)
-    camera.zoom = zoom
-    camera.position.set(Math.min(worldWidth / 2, window.innerWidth / zoom / 2), worldHeight / 2, 100)
+    camera.zoom = START_ZOOM
+    camera.position.set(startX, startY, 100)
     camera.updateProjectionMatrix()
     // Only on mount: later resizes keep the player's view.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -40,7 +43,7 @@ export function CameraRig({ worldWidth, worldHeight }: Props) {
       // Keep the world point under the cursor fixed while zooming.
       const worldX = camera.position.x + offsetX / camera.zoom
       const worldY = camera.position.y + offsetY / camera.zoom
-      camera.zoom = clampZoom(camera.zoom * Math.exp(-e.deltaY * 0.0015))
+      camera.zoom = clampZoom(camera.zoom * Math.exp(-e.deltaY * 0.0015), rect.width, rect.height)
       camera.updateProjectionMatrix()
       camera.position.x = worldX - offsetX / camera.zoom
       camera.position.y = worldY - offsetY / camera.zoom
@@ -63,6 +66,7 @@ export function CameraRig({ worldWidth, worldHeight }: Props) {
     }
 
     el.addEventListener('wheel', onWheel, { passive: false })
+    // (clampZoom only depends on the world's size, which doesn't change.)
     el.addEventListener('pointerdown', onPointerDown)
     el.addEventListener('pointermove', onPointerMove)
     el.addEventListener('pointerup', onPointerUp)
@@ -72,25 +76,28 @@ export function CameraRig({ worldWidth, worldHeight }: Props) {
       el.removeEventListener('pointermove', onPointerMove)
       el.removeEventListener('pointerup', onPointerUp)
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [camera, gl])
 
-  useFrame(({ camera }, delta) => {
+  useFrame(({ camera, size }, delta) => {
     const speed = ((input.fast() ? 3 : 1) * PAN_SPEED * delta) / camera.zoom
     camera.position.x += (Number(input.right()) - Number(input.left())) * speed
     camera.position.y += (Number(input.up()) - Number(input.down())) * speed
 
+    // (Also after the window is resized larger than the world allows at this zoom.)
     const zoomDir = Number(input.zoomIn()) - Number(input.zoomOut())
-    if (zoomDir !== 0) {
-      camera.zoom = clampZoom(camera.zoom * Math.pow(KEY_ZOOM_RATE, zoomDir * delta))
+    const zoom = clampZoom(camera.zoom * Math.pow(KEY_ZOOM_RATE, zoomDir * delta), size.width, size.height)
+    if (zoom !== camera.zoom) {
+      camera.zoom = zoom
       camera.updateProjectionMatrix()
     }
 
-    // Keep at least part of the world on screen.
-    camera.position.x = Math.min(worldWidth, Math.max(0, camera.position.x))
-    camera.position.y = Math.min(worldHeight, Math.max(0, camera.position.y))
+    // Keep the edges of the screen inside the world.
+    const halfWidth = size.width / 2 / camera.zoom
+    const halfHeight = size.height / 2 / camera.zoom
+    camera.position.x = Math.min(worldWidth - halfWidth, Math.max(halfWidth, camera.position.x))
+    camera.position.y = Math.min(worldHeight - halfHeight, Math.max(halfHeight, camera.position.y))
   })
 
   return null
 }
-
-const clampZoom = (zoom: number) => Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, zoom))

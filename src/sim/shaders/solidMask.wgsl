@@ -4,28 +4,50 @@
 // (it would hold the body down like a ceiling); its weight is a load instead
 // (bodyForces.wgsl). Liquids, gases and bodies aren't ground.
 //
-// One invocation per column, walking it bottom to top. Bits are column-major: column x
-// is words x * wordsPerColumn .. (x + 1) * wordsPerColumn - 1, bit y % 32 of word y / 32.
+// For the chunks bodies are near (LIST_GROUND), one invocation per column of each, walking
+// it bottom to top (after looking down the powder piled under it, into the chunk below).
+// Bits are column-major, chunk after chunk in the list's order: column x of the n-th is
+// words (n * CHUNK_SIZE + x) * MASK_WORDS .. + MASK_WORDS - 1, bit y % 32 of word y / 32.
 fn solidMask(
   cells: ptr<storage, array<u32>, read_write>,
   bodies: ptr<storage, array<f32>, read_write>,
   mask: ptr<storage, array<u32>, read_write>,
+  table: ptr<storage, array<u32>, read_write>,
   index: u32,
-  size: vec2u,
 ) -> void {
-  if (index >= size.x) {
+  let n = index / CHUNK_SIZE;
+  if (n >= listCount(table, LIST_GROUND)) {
     return;
   }
-  let words = (size.y + 31u) / 32u;
-  var supported = true;  // below the world counts as stone
-  for (var w = i32(words) - 1; w >= 0; w--) {
+  let chunk = listEntry(table, LIST_GROUND, n);
+  let page = (*table)[chunk];
+  let first = chunkOrigin(chunk);
+  let x = first.x + i32(index % CHUNK_SIZE);
+  let column = index * MASK_WORDS;
+
+  // Whether the cell below the chunk is ground, or powder resting on it (below the world,
+  // or past a chunk with no slot or a chunk's worth of powder, counts as ground).
+  var supported = true;
+  for (var y = first.y + i32(CHUNK_SIZE); y < first.y + i32(CHUNK_SIZE) * 2; y++) {
+    let i = cellIndex(table, vec2i(x, y));
+    if (i == CELL_NONE) {
+      break;
+    }
+    let cell = (*cells)[i];
+    if (cellKind(cell) != KIND_POWDER) {
+      if (cellMaterial(cell) == MAT_BODY) {
+        supported = (*bodies)[min(cellShade(cell), MAX_BODIES - 1u) * BODY_FLOATS + 10u] != 0.0;
+      } else {
+        supported = cellKind(cell) == KIND_SOLID;
+      }
+      break;
+    }
+  }
+
+  for (var w = i32(MASK_WORDS) - 1; w >= 0; w--) {
     var bits = 0u;
     for (var b = 31; b >= 0; b--) {
-      let y = u32(w) * 32u + u32(b);
-      if (y >= size.y) {
-        continue;
-      }
-      let cell = (*cells)[y * size.x + index];
+      let cell = (*cells)[slotCell(page, vec2i(x, first.y + w * 32 + b))];
       let m = cellMaterial(cell);
       var solid = false;
       if (m == MAT_BODY) {
@@ -43,6 +65,6 @@ fn solidMask(
         bits |= 1u << u32(b);
       }
     }
-    (*mask)[index * words + u32(w)] = bits;
+    (*mask)[column + u32(w)] = bits;
   }
 }

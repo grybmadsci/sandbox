@@ -1,4 +1,5 @@
-// Fragment color for the world plane: looks up the cell under `uv` and shades it.
+// Fragment color for the world: looks up the cell under `uv` and shades it, or leaves it
+// clear (for the overview behind) where its chunk has no slot.
 // Colors are authored in sRGB and converted to linear for three's output pipeline.
 // view 1 is the pressure view: liquid pressure (rows of liquid above, from the body's
 // highest surface, plus the air pushing on it) on a log scale from 0 to 256 rows, with
@@ -13,18 +14,22 @@ fn sandColor(
   bodies: ptr<storage, array<f32>, read>,
   lasers: ptr<storage, array<f32>, read>,
   laserHits: ptr<storage, array<f32>, read>,
+  table: ptr<storage, array<u32>, read>,
   laserCount: u32,
   uv: vec2f,
-  size: vec2u,
-  airSize: vec2u,
   time: f32,
   view: u32,
 ) -> vec4f {
-  let gx = min(u32(max(uv.x, 0.0) * f32(size.x)), size.x - 1u);
-  let gy = min(u32(max(1.0 - uv.y, 0.0) * f32(size.y)), size.y - 1u);
-  let cell = (*cells)[gy * size.x + gx];
+  let gx = min(u32(max(uv.x, 0.0) * f32(WORLD_SIZE)), WORLD_SIZE - 1u);
+  let gy = min(u32(max(1.0 - uv.y, 0.0) * f32(WORLD_SIZE)), WORLD_SIZE - 1u);
+  let page = renderPage(table, i32(gx), i32(gy));
+  if (page == 0u) {
+    return vec4f(0.0);
+  }
+  let i = slotCell(page, vec2i(i32(gx), i32(gy)));
+  let cell = (*cells)[i];
   let m = cellMaterial(cell);
-  let sky = mix(vec3f(0.06, 0.08, 0.14), vec3f(0.12, 0.14, 0.22), f32(gy) / f32(size.y));
+  let sky = mix(vec3f(0.06, 0.08, 0.14), vec3f(0.12, 0.14, 0.22), f32(gy) / f32(WORLD_SIZE));
 
   var color: vec3f;
   if (m == MAT_EMPTY) {
@@ -63,16 +68,16 @@ fn sandColor(
   // A pool's top row, when only partly full, is drawn as an even film as full as the
   // row is nearby, so loose cells sliding along it don't flicker. Only where the row
   // below is mostly liquid, so falling drops and streams stay crisp.
-  if (gy + 1u < size.y && (cellKind(cell) == KIND_LIQUID || cellKind(cell) == KIND_EMPTY)) {
+  if (gy + 1u < WORLD_SIZE && (cellKind(cell) == KIND_LIQUID || cellKind(cell) == KIND_EMPTY)) {
     var liquid = 0;
     var open = 0;
     var below = 0;
     var pool = MAT_EMPTY;
     for (var dx = -3; dx <= 3; dx++) {
       let x = i32(gx) + dx;
-      if (x >= 0 && x < i32(size.x)) {
-        let here = (*cells)[gy * size.x + u32(x)];
-        let under = (*cells)[(gy + 1u) * size.x + u32(x)];
+      if (x >= 0 && x < i32(WORLD_SIZE)) {
+        let here = renderCell(cells, table, x, i32(gy));
+        let under = renderCell(cells, table, x, i32(gy) + 1);
         if (cellKind(here) == KIND_LIQUID) {
           liquid++;
           pool = cellMaterial(here);
@@ -84,7 +89,7 @@ fn sandColor(
         }
       }
     }
-    let above = select(MAT_EMPTY, (*cells)[(gy - 1u) * size.x + gx], gy > 0u);
+    let above = renderCell(cells, table, i32(gx), i32(gy) - 1);
     let surfaceRow = liquid > 0 && liquid < open && cellKind(above) != KIND_LIQUID;
     if (surfaceRow && below >= 5) {
       let fill = f32(liquid) / f32(open);
@@ -93,18 +98,19 @@ fn sandColor(
   }
 
   if (view == 1u) {
-    let a = airIndex(vec2i(i32(gx), i32(gy)) / i32(AIR_CELL), airSize);
+    let a = slotAir(page, vec2i(i32(gx), i32(gy)) / i32(AIR_CELL));
     // -1 at vacuum, 0 at one atmosphere, 1 at two; square-rooted so small differences
     // still show.
     let relative = clamp(f32((*gauges)[gaugeIndex(a) + GAUGE_AVERAGE]) / f32(AIR_AMBIENT), -1.0, 1.0);
     let shown = sign(relative) * sqrt(abs(relative));
     color = color * 0.3 + vec3f(max(shown, 0.0), 0.0, max(-shown, 0.0)) * 0.7;
-    let f = (*field)[gy * size.x + gx];
+    let f = (*field)[i];
     if (cellKind(cell) == KIND_LIQUID && f != FIELD_NONE && fieldHead(f) != HEAD_INF) {
       // Rows of depth below the highest surface (the head, less what it gained crossing
-      // columns), which already includes the air pushing on that surface.
-      let highest = f32(fieldHead(f)) - f32(hopsCount((*hops)[gy * size.x + gx]));
-      let depth = max(f32(gy) - highest / f32(HEAD_ONE) + f32(HEAD_BASE), 0.0);
+      // columns), which already includes the air pushing on that surface. Heads count from
+      // the chunk's top row.
+      let highest = f32(fieldHead(f)) - f32(hopsCount((*hops)[i]));
+      let depth = max(f32(gy % CHUNK_SIZE) - highest / f32(HEAD_ONE) + f32(HEAD_BASE), 0.0);
       // Log scale, so shallow water (most of it) spreads over most of the colours.
       let t = clamp(log2(1.0 + depth / 8.0) / log2(33.0), 0.0, 1.0);
       color = pressureColor(t);
@@ -118,7 +124,7 @@ fn sandColor(
   // the beam is drawn), pulses running toward the target, a glow where each ray bites
   // into something, and sparks flying off it; the glow and sparks are brightest where the
   // beam itself lands, fading toward the edges of the band the rays cut.
-  let at = vec2f(uv.x * f32(size.x), (1.0 - uv.y) * f32(size.y));
+  let at = vec2f(uv.x * f32(WORLD_SIZE), (1.0 - uv.y) * f32(WORLD_SIZE));
   const BEAM_HALF = 0.75;
   // Flying sparks: SPARK_COUNT per laser, each living SPARK_LIFE seconds (then born again
   // at another bite), flung back off the stone at SPARK_SPEED cells a second and falling;
@@ -201,4 +207,19 @@ fn sandColor(
     }
   }
   return vec4f(pow(min(color, vec3f(1.0)), vec3f(2.2)), 1.0);
+}
+
+// The page of the chunk holding cell (x, y), as pageAt (common.wgsl) but read-only, as a
+// fragment shader's storage is.
+fn renderPage(table: ptr<storage, array<u32>, read>, x: i32, y: i32) -> u32 {
+  if (x < 0 || y < 0 || x >= i32(WORLD_SIZE) || y >= i32(WORLD_SIZE)) {
+    return 0u;
+  }
+  return (*table)[u32(y) / CHUNK_SIZE * WORLD_CHUNKS + u32(x) / CHUNK_SIZE];
+}
+
+// A cell, or empty space where its chunk has no slot (or outside the world).
+fn renderCell(cells: ptr<storage, array<u32>, read>, table: ptr<storage, array<u32>, read>, x: i32, y: i32) -> u32 {
+  let page = renderPage(table, x, y);
+  return select(MAT_EMPTY, (*cells)[slotCell(page, vec2i(x, y))], page != 0u);
 }

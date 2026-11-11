@@ -1,24 +1,30 @@
 // Air brush: inside the capsule strokeStart -> strokeEnd (cell units), pumps in
 // pressure and adds wind along the stroke; with a negative `pressure` (the vacuum
-// tool) it takes air out instead, down to none, without wind. One invocation per air cell.
+// tool) it takes air out instead, down to none, without wind. One invocation per air
+// cell of the stroke's bounds (`boxX`, `boxY`: its first air cell, `boxWidth`: air cells across), in the
+// chunks with a slot.
 fn blowAir(
   air: ptr<storage, array<i32>, read_write>,
+  table: ptr<storage, array<u32>, read_write>,
   index: u32,
-  airSize: vec2u,
+  boxX: i32,
+  boxY: i32,
+  boxWidth: i32,
   strokeStart: vec2f,
   strokeEnd: vec2f,
   radius: f32,
   pressure: i32,
 ) -> void {
-  if (index >= airSize.x * airSize.y) {
+  let q = vec2i(boxX, boxY) + vec2i(i32(index) % boxWidth, i32(index) / boxWidth);
+  let i = airIndex(table, q);
+  if (i == CELL_NONE) {
     return;
   }
-  let i = index * 4u;
   let volume = airVolume((*air)[i + AIR_VOLUME]);
   if (volume <= 0) {
     return;
   }
-  let p = (vec2f(f32(index % airSize.x), f32(index / airSize.x)) + 0.5) * f32(AIR_CELL);
+  let p = (vec2f(q) + 0.5) * f32(AIR_CELL);
 
   let ab = strokeEnd - strokeStart;
   let t = clamp(dot(p - strokeStart, ab) / max(dot(ab, ab), 1e-6), 0.0, 1.0);

@@ -21,15 +21,15 @@
 // rows where bodies are now (`bodies`) or were at the last stamp (`before`, the bodies
 // as uploaded then) can change, plus the empty cells above that displaced particles go
 // to; the room for them is only counted as far as anything could need. Columns where
-// nothing has changed are skipped.
+// nothing has changed are skipped. Cells in chunks with no slot are as stone.
 fn stampBodies(
   cells: ptr<storage, array<u32>, read_write>,
   bodies: ptr<storage, array<f32>, read_write>,
   before: ptr<storage, array<f32>, read_write>,
   pressures: ptr<storage, array<f32>, read_write>,
   forces: ptr<storage, array<atomic<i32>>, read_write>,
+  table: ptr<storage, array<u32>, read_write>,
   index: u32,
-  size: vec2u,
   range: vec2u,
   seed: u32,
 ) -> void {
@@ -41,10 +41,10 @@ fn stampBodies(
     atomicStore(&(*forces)[index], 0);
   }
   let x = range.x + index;
-  if (x >= range.y || x >= size.x) {
+  if (x >= range.y || x >= WORLD_SIZE) {
     return;
   }
-  let h = i32(size.y);
+  let h = i32(WORLD_SIZE);
   let cx = f32(x) + 0.5;
 
   // Nothing to do if every body here was stamped just like this last time (bodies.ts
@@ -117,7 +117,7 @@ fn stampBodies(
   // particles, as much as could be needed.
   var room = 0u;
   for (var y = 0; y < h && room < ROOM_ENOUGH; y++) {
-    let m = cellMaterial((*cells)[u32(y) * size.x + x]);
+    let m = cellMaterial(cellOrStone(cells, table, vec2i(i32(x), y)));
     if (m == MAT_EMPTY || m == MAT_BODY) {
       var covered = false;
       for (var k = 0u; k < count && !covered; k++) {
@@ -131,7 +131,7 @@ fn stampBodies(
   // grid counts as stone).
   var grounded = true;
   for (var y = bottom + 1; y < h; y++) {
-    let cell = (*cells)[u32(y) * size.x + x];
+    let cell = cellOrStone(cells, table, vec2i(i32(x), y));
     let m = cellMaterial(cell);
     if (((POWDER_MATERIALS >> m) & 1u) == 0u) {
       grounded = m == MAT_STONE
@@ -146,8 +146,8 @@ fn stampBodies(
   var head = 0u;
   var queued = 0u;
   for (var y = bottom; y >= 0 && (y >= top || queued > 0u); y--) {
-    let i = u32(y) * size.x + x;
-    let cell = (*cells)[i];
+    let i = cellIndex(table, vec2i(i32(x), y));
+    let cell = select(MAT_STONE, (*cells)[min(i, SLOT_COUNT * CHUNK_CELLS - 1u)], i != CELL_NONE);
     let m = cellMaterial(cell);
     // (Bit tests, not table lookups: this runs for every cell of the walk, serially.)
     let groundedBelow = grounded;
@@ -167,7 +167,7 @@ fn stampBodies(
       let bearing = select(0.0, MATERIAL_BEARING[m], powder && groundedBelow);
       if (bearing > 0.0 && (*bodies)[cover * BODY_FLOATS + 10u] == 0.0) {
         let overload = clamp((*pressures)[cover] / bearing - 1.0, 0.0, 1.0);
-        yields = chance16(hashPcg(i ^ hashPcg(seed)), u32(overload * YIELD_MAX * 65535.0));
+        yields = chance16(hashPcg(worldCellId(vec2i(i32(x), y)) ^ hashPcg(seed)), u32(overload * YIELD_MAX * 65535.0));
       }
       if (m == MAT_EMPTY || m == MAT_BODY) {
         next = bodyCell(cover);
@@ -194,8 +194,8 @@ fn stampBodies(
 
   // 3. No room above: the rest go into the highest empty cells (there is room for them).
   for (var y = 0; y < h && queued > 0u; y++) {
-    let i = u32(y) * size.x + x;
-    if (cellMaterial((*cells)[i]) == MAT_EMPTY) {
+    let i = cellIndex(table, vec2i(i32(x), y));
+    if (i != CELL_NONE && cellMaterial((*cells)[i]) == MAT_EMPTY) {
       (*cells)[i] = queue[head];
       head = (head + 1u) % DISPLACE_MAX;
       queued--;

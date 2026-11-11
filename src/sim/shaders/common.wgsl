@@ -52,16 +52,22 @@ fn withStoneDamage(cell: u32, damage: u32) -> u32 {
 }
 
 // Pressure field, one u32 per liquid cell (written by pressure.wgsl), FIELD_NONE elsewhere:
-//   bits 0-15  head: row of the body's highest free surface plus HEAD_BASE (air
-//              pressure can lift a surface above row 0), in 1/HEAD_ONE rows
+//   bits 0-15  head: row of the body's highest free surface, counted from the top row of
+//              the cell's chunk plus HEAD_BASE (the surface may be chunks above it, and
+//              air pressure can lift it further), in 1/HEAD_ONE rows
 //   bits 16-17 which side the head came from (FROM_*)
 //   bits 18-29 hop distance to the nearest sink
 //   bits 30-31 which side the distance came from
+// Counting from the chunk's top keeps heads small in a world of any height: cells in the
+// same row, which are the only ones that compare heads, count from the same row.
 const HEAD_ONE: u32 = 16u;
-// Rows added to every head, so it stays positive however hard air pushes on a surface
-// (AIR_MAX_LIFT). The largest head, (512 + HEAD_BASE + 1024 rows of suction) * 16,
-// fits below HEAD_INF.
-const HEAD_BASE: u32 = 1024u;
+// Rows added to every head, so it stays positive for a surface up to HEAD_BASE - 1024
+// rows above the chunk however hard air pushes on it (AIR_MAX_LIFT); deeper bodies of
+// liquid stop levelling out. The largest head, (CHUNK_SIZE + HEAD_BASE + 1024 rows of
+// suction) * 16, fits below HEAD_INF.
+const HEAD_BASE: u32 = 2048u;
+// A chunk's worth of rows, in head units: what a head changes by from one chunk row to the next.
+const HEAD_CHUNK: u32 = CHUNK_SIZE * HEAD_ONE;
 const FIELD_NONE: u32 = 0xffffffffu;
 const HEAD_INF: u32 = 0xffffu;
 const DIST_INF: u32 = 0xfffu;
@@ -75,6 +81,12 @@ fn makeField(head: u32, headFrom: u32, distance: u32, distanceFrom: u32) -> u32 
 
 fn fieldHead(f: u32) -> u32 {
   return f & 0xffffu;
+}
+
+// A head counted from `chunks` chunk rows further down (a smaller number; 0, the highest,
+// if it doesn't fit), keeping HEAD_INF (no head) as it is.
+fn headBelow(head: u32, chunks: u32) -> u32 {
+  return select(head - min(head, chunks * HEAD_CHUNK), HEAD_INF, head >= HEAD_INF);
 }
 
 fn fieldHeadFrom(f: u32) -> u32 {
@@ -124,18 +136,111 @@ fn flipDirection(cell: u32) -> u32 {
   return cell ^ (1u << 16u);
 }
 
-// A cell's bit in a column-major mask of one bit per cell (shelter.wgsl, solidMask.wgsl).
-fn maskBit(mask: ptr<storage, array<u32>, read_write>, p: vec2i, size: vec2u) -> bool {
-  let words = (size.y + 31u) / 32u;
-  return (((*mask)[u32(p.x) * words + u32(p.y) / 32u] >> (u32(p.y) % 32u)) & 1u) != 0u;
+// The world is WORLD_CHUNKS x WORLD_CHUNKS chunks, CHUNK_SIZE cells across, and positions
+// are world cells. Only some chunks are on the GPU, each in a slot of the buffers (its
+// cells, its air, its masks), found through the page table (`table`, world/config.ts): a
+// page per chunk, 0 when it has no slot, else the slot + 1, with PAGE_LIVE set when it is
+// simulated. Kernels run over lists of chunks in the table (LIST_*), leave the cells of
+// chunks that aren't live alone, and treat them (and the rest of the world, and outside it)
+// like walls.
+const CELL_NONE: u32 = 0xffffffffu;
+const CHUNK_CELLS: u32 = CHUNK_SIZE * CHUNK_SIZE;
+
+fn inWorld(p: vec2i) -> bool {
+  return p.x >= 0 && p.y >= 0 && p.x < i32(WORLD_SIZE) && p.y < i32(WORLD_SIZE);
 }
 
-fn inGrid(p: vec2i, size: vec2u) -> bool {
-  return p.x >= 0 && p.y >= 0 && p.x < i32(size.x) && p.y < i32(size.y);
+// The page of the chunk holding cell p (0 outside the world).
+fn pageAt(table: ptr<storage, array<u32>, read_write>, p: vec2i) -> u32 {
+  if (!inWorld(p)) {
+    return 0u;
+  }
+  let c = vec2u(p) / CHUNK_SIZE;
+  return (*table)[c.y * WORLD_CHUNKS + c.x];
 }
 
-fn gridIndex(p: vec2i, size: vec2u) -> u32 {
-  return u32(p.y) * size.x + u32(p.x);
+fn pageSlot(page: u32) -> u32 {
+  return (page & ~PAGE_LIVE) - 1u;
+}
+
+fn pageLive(page: u32) -> bool {
+  return (page & PAGE_LIVE) != 0u;
+}
+
+// Where cell p is in the cell buffers, in the slot of its chunk's page (which isn't 0).
+fn slotCell(page: u32, p: vec2i) -> u32 {
+  let local = vec2u(p) % CHUNK_SIZE;
+  return pageSlot(page) * CHUNK_CELLS + local.y * CHUNK_SIZE + local.x;
+}
+
+// Where cell p is in the cell buffers, or CELL_NONE when its chunk has no slot.
+fn cellIndex(table: ptr<storage, array<u32>, read_write>, p: vec2i) -> u32 {
+  let page = pageAt(table, p);
+  return select(CELL_NONE, slotCell(page, p), page != 0u);
+}
+
+// The same, but CELL_NONE unless its chunk is live.
+fn liveCell(table: ptr<storage, array<u32>, read_write>, p: vec2i) -> u32 {
+  let page = pageAt(table, p);
+  return select(CELL_NONE, slotCell(page, p), pageLive(page));
+}
+
+// For walking down column x (pressure.wgsl), looking up chunks once per chunk rather than
+// once per cell: where the chunk row holding row y starts in the cell buffers, for column
+// x and the columns either side (x - 1, x, x + 1), each CELL_NONE where that chunk isn't
+// live (or is outside the world). `liveAt` then finds a cell of the chunk row.
+fn liveBases(table: ptr<storage, array<u32>, read_write>, x: i32, y: i32) -> vec3u {
+  let top = y - y % i32(CHUNK_SIZE);
+  return vec3u(liveCell(table, vec2i(x - 1, top)), liveCell(table, vec2i(x, top)), liveCell(table, vec2i(x + 1, top)));
+}
+
+fn liveAt(base: u32, y: i32) -> u32 {
+  return select(CELL_NONE, base + u32(y % i32(CHUNK_SIZE)) * CHUNK_SIZE, base != CELL_NONE);
+}
+
+// A cell, as stone where its chunk has no slot (or outside the world).
+fn cellOrStone(cells: ptr<storage, array<u32>, read_write>, table: ptr<storage, array<u32>, read_write>, p: vec2i) -> u32 {
+  let i = cellIndex(table, p);
+  return select(MAT_STONE, (*cells)[min(i, SLOT_COUNT * CHUNK_CELLS - 1u)], i != CELL_NONE);
+}
+
+// The lists of chunks kernels run over: how many, and the n-th (a chunk index).
+fn listCount(table: ptr<storage, array<u32>, read_write>, list: u32) -> u32 {
+  return (*table)[TABLE_LISTS + list * LIST_STRIDE];
+}
+
+fn listEntry(table: ptr<storage, array<u32>, read_write>, list: u32, n: u32) -> u32 {
+  return (*table)[TABLE_LISTS + list * LIST_STRIDE + 1u + n];
+}
+
+// Invocations per chunk of step.wgsl (blocks across, with a spare) and flow.wgsl (pairs
+// across, with a spare, and rows of one row phase).
+const BLOCKS_ACROSS: u32 = CHUNK_SIZE / 2u + 1u;
+const PAIRS_ACROSS: u32 = CHUNK_SIZE / 2u + 1u;
+const PHASE_ROWS: u32 = (CHUNK_SIZE + 2u) / 3u;
+
+// A chunk's first cell, from its index.
+fn chunkOrigin(chunk: u32) -> vec2i {
+  return vec2i(i32(chunk % WORLD_CHUNKS), i32(chunk / WORLD_CHUNKS)) * i32(CHUNK_SIZE);
+}
+
+// A world cell's number, for hashing: random choices depend on where they're made, not on
+// which slot a chunk happens to be in.
+fn worldCellId(p: vec2i) -> u32 {
+  return u32(p.y + 1) * (WORLD_SIZE + 2u) + u32(p.x + 1);
+}
+
+// Masks of one bit per cell (shelter.wgsl, solidMask.wgsl), a slot's after another's:
+// column-major in each, MASK_WORDS words per column.
+const MASK_WORDS: u32 = CHUNK_SIZE / 32u;
+
+fn maskWord(page: u32, p: vec2i) -> u32 {
+  let local = vec2u(p) % CHUNK_SIZE;
+  return (pageSlot(page) * CHUNK_SIZE + local.x) * MASK_WORDS + local.y / 32u;
+}
+
+fn maskBit(mask: ptr<storage, array<u32>, read_write>, page: u32, p: vec2i) -> bool {
+  return (((*mask)[maskWord(page, p)] >> (u32(p.y) % 32u)) & 1u) != 0u;
 }
 
 // PCG hash: https://www.jcgt.org/published/0009/03/02/
@@ -252,7 +357,7 @@ const AIR_VOLUME_FULL: i32 = 16;  // AIR_CELL * AIR_CELL
 // Air pressure equal to one row of liquid.
 const AIR_ROW: i32 = 256;
 // Absolute pressure of still air: one atmosphere, about 10 m of water, taken as 1024
-// rows (a cell is about 1 cm). That is far more than any column of liquid in the world,
+// rows (a cell is about 1 cm). That is far more than most columns of liquid in the world,
 // so sealed air barely compresses or stretches: it holds liquid up by suction
 // (siphons, upturned bottles) and pushes back hard when squeezed.
 const AIR_AMBIENT: i32 = 1024 * AIR_ROW;
@@ -301,9 +406,19 @@ const AIR_GAUGE_KNEE: i32 = 4 * AIR_ROW;
 // Largest flow through one face per substep: a quarter of a cell of still air.
 const AIR_MAX_FLOW: i32 = AIR_AMBIENT / 4;
 
-fn airIndex(p: vec2i, airSize: vec2u) -> u32 {
-  let q = clamp(p, vec2i(0), vec2i(airSize) - 1);
-  return (u32(q.y) * airSize.x + u32(q.x)) * 4u;
+// Air cells across a chunk; each slot's air cells follow the last slot's, row by row.
+const AIR_SIDE: u32 = CHUNK_SIZE / AIR_CELL;
+
+// Where air cell q (in air cells) is in the air buffer, in the slot of its chunk's page (which isn't 0).
+fn slotAir(page: u32, q: vec2i) -> u32 {
+  let local = vec2u(q) % AIR_SIDE;
+  return (pageSlot(page) * AIR_SIDE * AIR_SIDE + local.y * AIR_SIDE + local.x) * 4u;
+}
+
+// Where air cell q is in the air buffer, or CELL_NONE when its chunk has no slot.
+fn airIndex(table: ptr<storage, array<u32>, read_write>, q: vec2i) -> u32 {
+  let page = pageAt(table, q * i32(AIR_CELL));
+  return select(CELL_NONE, slotAir(page, q), page != 0u);
 }
 
 // Where an air cell's filter values (GAUGE_*) start, from its airIndex.
